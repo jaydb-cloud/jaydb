@@ -168,3 +168,63 @@ func TestForwardedReadForUnservedNamespaceFailsLoud(t *testing.T) {
 	}
 	t.Logf("failed loudly, as intended: %v", err)
 }
+
+// TestNamespaceCloseDoesNotTearDownSharedClusterNode verifies that closing one
+// namespace DB does not shut down the shared ClusterNode, its QUIC listener, or
+// its MeshPool. Other namespaces sharing the same ClusterNode must remain
+// fully functional and able to route inter-queries.
+func TestNamespaceCloseDoesNotTearDownSharedClusterNode(t *testing.T) {
+	n1, n2, ring := twoNodeMesh(t)
+
+	d1A, err := db.Open(db.Options{Storage: memory.NewDriver(), Ring: ring, ClusterNode: n1, Namespace: "ns-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d1B, err := db.Open(db.Options{Storage: memory.NewDriver(), Ring: ring, ClusterNode: n1, Namespace: "ns-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2B, err := db.Open(db.Options{Storage: memory.NewDriver(), Ring: ring, ClusterNode: n2, Namespace: "ns-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = d1B.Close()
+		_ = d2B.Close()
+	})
+
+	// Close ns-a on node 1. This must NOT close n1 or n1's MeshPool!
+	if err := d1A.Close(); err != nil {
+		t.Fatalf("d1A.Close(): %v", err)
+	}
+
+	// Put a document in ns-b on node 2 for a key owned by node 2
+	var localKeyB string
+	for i := 0; i < 5000; i++ {
+		k := fmt.Sprintf("testb/%d", i)
+		if ring.GetNode(k) == n2.SelfQuicAddr() {
+			localKeyB = k
+			break
+		}
+	}
+	if localKeyB == "" {
+		t.Skip("no key owned by n2 found")
+	}
+
+	payload := `{"title":"Task 1"}`
+	if _, err := d2B.PutRaw(context.Background(), localKeyB, []byte(payload), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Node 1 reads ns-b over the inter-query mesh. If n1's meshPool was killed, this would fail with
+	// "peer pool for <addr> not found" or "peer pool is closed".
+	var gotRaw []byte
+	_, err = d1B.Get(context.Background(), localKeyB, &gotRaw)
+	if err != nil {
+		t.Fatalf("inter-query from d1B failed after d1A.Close(): %v", err)
+	}
+	if string(gotRaw) != payload {
+		t.Fatalf("unexpected content: %s, want %s", string(gotRaw), payload)
+	}
+}
+
