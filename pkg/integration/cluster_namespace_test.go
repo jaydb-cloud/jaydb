@@ -227,4 +227,3 @@ func TestNamespaceCloseDoesNotTearDownSharedClusterNode(t *testing.T) {
 		t.Fatalf("unexpected content: %s, want %s", string(gotRaw), payload)
 	}
 }
-
