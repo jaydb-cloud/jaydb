@@ -598,7 +598,12 @@ func (d *database) Close() error {
 		// storage driver down, so peers get an explicit error instead of hitting
 		// a closed driver.
 		d.opts.ClusterNode.UnregisterHandler(d.opts.Namespace)
-		_ = d.opts.ClusterNode.Close()
+		// Only close ClusterNode if Namespace was not set (single-database embedded
+		// legacy mode). For multi-tenant hosts sharing a ClusterNode across
+		// namespaces, the host manages ClusterNode's lifecycle.
+		if d.opts.Namespace == "" {
+			_ = d.opts.ClusterNode.Close()
+		}
 	}
 
 	// Hand this database's cached bytes back to the shared budget and stop being

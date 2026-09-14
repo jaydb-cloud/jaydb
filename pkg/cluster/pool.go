@@ -399,6 +399,12 @@ func (m *MeshPool) RemovePeer(targetAddr string) {
 
 // GetStream retrieves an active pre-opened stream to targetAddr.
 func (m *MeshPool) GetStream(ctx context.Context, targetAddr string) (*quic.Stream, func(), error) {
+	select {
+	case <-m.ctx.Done():
+		return nil, nil, ErrPeerPoolClosed
+	default:
+	}
+
 	m.mu.RLock()
 	pool, exists := m.peers[targetAddr]
 	m.mu.RUnlock()
@@ -412,6 +418,11 @@ func (m *MeshPool) GetStream(ctx context.Context, targetAddr string) (*quic.Stre
 	}
 
 	if pool == nil {
+		select {
+		case <-m.ctx.Done():
+			return nil, nil, ErrPeerPoolClosed
+		default:
+		}
 		return nil, nil, fmt.Errorf("peer pool for %s not found", targetAddr)
 	}
 
