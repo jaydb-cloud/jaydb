@@ -260,3 +260,82 @@ func TestListStopsWhenAPageMakesNoProgress(t *testing.T) {
 func timeoutAfterSeconds(n int) <-chan time.Time {
 	return time.After(time.Duration(n) * time.Second)
 }
+
+func TestListPageCachingAndInvalidation(t *testing.T) {
+	driver := &cappedDriver{Driver: memory.NewDriver(), pageCap: 100}
+	database, err := db.Open(db.Options{
+		Storage:      driver,
+		ListCacheTTL: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	defer database.Close()
+
+	ctx := context.Background()
+	_, _ = database.Put(ctx, "tasks/1", map[string]string{"title": "task 1"})
+	_, _ = database.Put(ctx, "tasks/2", map[string]string{"title": "task 2"})
+
+	initialCalls := driver.listCalls
+
+	// 1. First ListPage: cache miss, hits storage
+	items, _, err := database.ListPage(ctx, "tasks/", db.ListPageOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListPage 1 failed: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+	if driver.listCalls != initialCalls+1 {
+		t.Fatalf("expected 1 storage list call, got %d", driver.listCalls-initialCalls)
+	}
+
+	// 2. Second ListPage: cache hit, storage NOT called!
+	items2, _, err := database.ListPage(ctx, "tasks/", db.ListPageOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListPage 2 failed: %v", err)
+	}
+	if len(items2) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items2))
+	}
+	if driver.listCalls != initialCalls+1 {
+		t.Fatalf("expected storage list calls to remain %d, got %d", initialCalls+1, driver.listCalls)
+	}
+
+	// 3. Put new document under "tasks/": must invalidate list cache
+	_, err = database.Put(ctx, "tasks/3", map[string]string{"title": "task 3"})
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// 4. Third ListPage: cache missed due to invalidation, fetches fresh from storage
+	items3, _, err := database.ListPage(ctx, "tasks/", db.ListPageOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListPage 3 failed: %v", err)
+	}
+	if len(items3) != 3 {
+		t.Fatalf("expected 3 items after put, got %d", len(items3))
+	}
+	if driver.listCalls != initialCalls+2 {
+		t.Fatalf("expected storage list calls to be %d, got %d", initialCalls+2, driver.listCalls)
+	}
+
+	// 5. Delete document under "tasks/": must invalidate list cache
+	err = database.Delete(ctx, "tasks/1")
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	// 6. Fourth ListPage: cache missed due to delete invalidation
+	items4, _, err := database.ListPage(ctx, "tasks/", db.ListPageOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListPage 4 failed: %v", err)
+	}
+	if len(items4) != 2 {
+		t.Fatalf("expected 2 items after delete, got %d", len(items4))
+	}
+	if driver.listCalls != initialCalls+3 {
+		t.Fatalf("expected storage list calls to be %d, got %d", initialCalls+3, driver.listCalls)
+	}
+}
+
