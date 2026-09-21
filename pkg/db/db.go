@@ -61,6 +61,13 @@ type Options struct {
 	// across every db.Open in the process to give them a single memory
 	// ceiling. nil = unbounded, not shared.
 	CacheBudget *cache.Budget
+
+	// ListCacheTTL is the freshness window for directory listing and prefix queries.
+	// 0 = default (30s). Negative (< 0) disables list caching.
+	ListCacheTTL time.Duration
+
+	// ListCacheMaxPages caps the number of cached list pages. 0 = default (500).
+	ListCacheMaxPages int
 }
 
 // PutOptions specifies options for write operations.
@@ -109,6 +116,7 @@ type DB interface {
 	// empty returned cursor means the keyspace is exhausted.
 	ListPage(ctx context.Context, prefix string, opts ListPageOptions) (items []*Item, next string, err error)
 	Cache() *cache.Manager
+	ListCache() *cache.ListCache
 	ShardingDepth() int
 	GetRaw(ctx context.Context, key string) (*storage.Object, error)
 	PutRaw(ctx context.Context, key string, value []byte, expectedETag string) (*storage.Object, error)
@@ -119,6 +127,7 @@ type DB interface {
 type database struct {
 	opts         Options
 	cacheMgr     *cache.Manager
+	listCache    *cache.ListCache
 	codec        encoding.Codec
 	storageDrive storage.Driver
 
@@ -153,9 +162,18 @@ func Open(opts Options) (DB, error) {
 		Budget:        opts.CacheBudget,
 	})
 
+	var listCache *cache.ListCache
+	if opts.ListCacheTTL >= 0 {
+		listCache = cache.NewListCache(opts.Storage, cache.ListConfig{
+			TTL:      opts.ListCacheTTL,
+			MaxPages: opts.ListCacheMaxPages,
+		})
+	}
+
 	d := &database{
 		opts:         opts,
 		cacheMgr:     cacheMgr,
+		listCache:    listCache,
 		codec:        opts.Codec,
 		storageDrive: opts.Storage,
 	}
@@ -220,6 +238,9 @@ func (d *database) reconcileOwnership() {
 	if skippedGenerations {
 		d.purgeEverything()
 	} else {
+		if d.listCache != nil {
+			d.listCache.Purge()
+		}
 		d.cacheMgr.PurgeIf(func(key string) bool {
 			owner := ring.GetNode(key)
 			// An empty owner means the ring has no members at all; dropping the
@@ -254,6 +275,9 @@ func (d *database) reconcileOwnership() {
 // selective purge was in flight.
 func (d *database) purgeEverything() {
 	d.cacheMgr.PurgeIf(func(string) bool { return true })
+	if d.listCache != nil {
+		d.listCache.Purge()
+	}
 }
 
 func (d *database) Get(ctx context.Context, key string, dest any) (*Meta, error) {
@@ -402,6 +426,9 @@ func (d *database) Put(ctx context.Context, key string, doc any, opts ...PutOpti
 			if resp.Object == nil {
 				return nil, fmt.Errorf("inter-query to %s: %w", targetNode, cluster.ErrIncompleteResponse)
 			}
+			if d.listCache != nil {
+				d.listCache.InvalidateKey(key)
+			}
 			return &Meta{
 				Key:     resp.Object.Key,
 				ETag:    resp.Object.ETag,
@@ -413,6 +440,9 @@ func (d *database) Put(ctx context.Context, key string, doc any, opts ...PutOpti
 	obj, err := d.cacheMgr.Put(ctx, key, data, po.ExpectedETag)
 	if err != nil {
 		return nil, err
+	}
+	if d.listCache != nil {
+		d.listCache.InvalidateKey(key)
 	}
 
 	return &Meta{
@@ -450,11 +480,18 @@ func (d *database) Delete(ctx context.Context, key string, opts ...DeleteOption)
 			if resp.Err != "" {
 				return mapErrorString(resp.Err)
 			}
+			if d.listCache != nil {
+				d.listCache.InvalidateKey(key)
+			}
 			return nil
 		}
 	}
 
-	return d.cacheMgr.Delete(ctx, key, do.ExpectedETag)
+	err := d.cacheMgr.Delete(ctx, key, do.ExpectedETag)
+	if err == nil && d.listCache != nil {
+		d.listCache.InvalidateKey(key)
+	}
+	return err
 }
 
 // GetRaw, PutRaw and DeleteRaw are the owner-side entry points the cluster mesh
@@ -474,14 +511,22 @@ func (d *database) PutRaw(ctx context.Context, key string, value []byte, expecte
 	defer trace.StartRegion(ctx, "db.put_raw").End()
 	d.reconcileOwnership()
 
-	return d.cacheMgr.Put(ctx, key, value, expectedETag)
+	obj, err := d.cacheMgr.Put(ctx, key, value, expectedETag)
+	if err == nil && d.listCache != nil {
+		d.listCache.InvalidateKey(key)
+	}
+	return obj, err
 }
 
 func (d *database) DeleteRaw(ctx context.Context, key string, expectedETag string) error {
 	defer trace.StartRegion(ctx, "db.delete_raw").End()
 	d.reconcileOwnership()
 
-	return d.cacheMgr.Delete(ctx, key, expectedETag)
+	err := d.cacheMgr.Delete(ctx, key, expectedETag)
+	if err == nil && d.listCache != nil {
+		d.listCache.InvalidateKey(key)
+	}
+	return err
 }
 
 // listPageSize is the number of keys requested from storage per underlying
@@ -555,10 +600,21 @@ func (d *database) ListPage(ctx context.Context, prefix string, opts ListPageOpt
 		limit = listPageSize
 	}
 
-	metas, next, err := d.storageDrive.List(ctx, prefix, storage.ListOptions{
-		Limit:  limit,
-		Cursor: opts.Cursor,
-	})
+	var metas []*storage.KeyMeta
+	var next string
+	var err error
+
+	if d.listCache != nil {
+		metas, next, err = d.listCache.ListPage(ctx, prefix, storage.ListOptions{
+			Limit:  limit,
+			Cursor: opts.Cursor,
+		})
+	} else {
+		metas, next, err = d.storageDrive.List(ctx, prefix, storage.ListOptions{
+			Limit:  limit,
+			Cursor: opts.Cursor,
+		})
+	}
 	if err != nil {
 		return nil, "", err
 	}
@@ -584,6 +640,10 @@ func (d *database) Cache() *cache.Manager {
 	return d.cacheMgr
 }
 
+func (d *database) ListCache() *cache.ListCache {
+	return d.listCache
+}
+
 func (d *database) ShardingDepth() int {
 	return d.opts.ShardingDepth
 }
@@ -593,6 +653,9 @@ func (d *database) PartitionKey(key string) string {
 }
 
 func (d *database) Close() error {
+	if d.listCache != nil {
+		d.listCache.Purge()
+	}
 	if d.opts.ClusterNode != nil {
 		// Stop serving forwarded requests for this namespace before tearing the
 		// storage driver down, so peers get an explicit error instead of hitting

@@ -49,6 +49,46 @@ func TestLRULastAccessedUpdatedOnHit(t *testing.T) {
 	}
 }
 
+func TestCache_ReadsRefreshEvictionTime(t *testing.T) {
+	ctx := context.Background()
+	driver := memory.NewDriver()
+	mgr := NewManagerWithConfig(driver, Config{TTL: 60 * time.Millisecond})
+
+	if _, err := mgr.Put(ctx, "k1", []byte("val1"), ""); err != nil {
+		t.Fatalf("put k1: %v", err)
+	}
+
+	// Repeated reads at 25ms intervals.
+	// Total elapsed: 4 * 25ms = 100ms > 60ms TTL.
+	// Because each read refreshes LastAccessed, the entry must remain cached!
+	for i := 0; i < 4; i++ {
+		time.Sleep(25 * time.Millisecond)
+		obj, err := mgr.Get(ctx, "k1")
+		if err != nil {
+			t.Fatalf("read %d failed: %v", i, err)
+		}
+		if string(obj.Value) != "val1" {
+			t.Fatalf("read %d got unexpected value: %s", i, string(obj.Value))
+		}
+	}
+
+	hits, misses, _ := mgr.Stats()
+	if hits != 4 || misses != 0 {
+		t.Fatalf("expected 4 hits and 0 misses, got hits=%d misses=%d", hits, misses)
+	}
+
+	// Wait 70ms without reading: entry should now expire due to idle timeout
+	time.Sleep(70 * time.Millisecond)
+
+	// Invalidate driver copy so if Get falls through to driver it gets ErrNotFound
+	_ = driver.Delete(ctx, "k1", "")
+
+	_, err := mgr.Get(ctx, "k1")
+	if err == nil {
+		t.Fatal("expected ErrNotFound from storage after cache expired due to idle timeout")
+	}
+}
+
 func TestLRUEvictionStrictRecency(t *testing.T) {
 	ctx := context.Background()
 	budget := NewBudget(300)
