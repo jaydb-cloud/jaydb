@@ -338,4 +338,3 @@ func TestListPageCachingAndInvalidation(t *testing.T) {
 		t.Fatalf("expected storage list calls to be %d, got %d", initialCalls+3, driver.listCalls)
 	}
 }
-
