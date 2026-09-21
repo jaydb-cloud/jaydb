@@ -14,7 +14,9 @@ import (
 )
 
 // DefaultListTTL is the default freshness window for list cache pages.
-const DefaultListTTL = 30 * time.Second
+// Default to 24 hours matching document cache, with eviction driven by LRU
+// and invalidations, while idle entries expire after TTL.
+const DefaultListTTL = 24 * time.Hour
 
 // DefaultListMaxPages is the default cap on cached list pages.
 const DefaultListMaxPages = 500
@@ -37,10 +39,11 @@ func (k ListCacheKey) String() string {
 }
 
 type listCacheEntry struct {
-	key        ListCacheKey
-	items      []*storage.KeyMeta
-	nextCursor string
-	fetchedAt  time.Time
+	key          ListCacheKey
+	items        []*storage.KeyMeta
+	nextCursor   string
+	fetchedAt    time.Time
+	lastAccessed time.Time
 }
 
 type listSingleflightCall struct {
@@ -107,7 +110,8 @@ func (c *ListCache) ListPage(ctx context.Context, prefix string, opts storage.Li
 	c.mu.Lock()
 	if el, found := c.items[mapKey]; found {
 		entry := el.Value.(*listCacheEntry)
-		if now.Sub(entry.fetchedAt) < c.ttl {
+		if c.ttl <= 0 || now.Sub(entry.lastAccessed) < c.ttl {
+			entry.lastAccessed = now
 			c.lru.MoveToFront(el)
 			c.mu.Unlock()
 			atomic.AddUint64(&c.hits, 1)
@@ -147,7 +151,8 @@ func (c *ListCache) ListPage(ctx context.Context, prefix string, opts storage.Li
 	c.mu.Lock()
 	if el, found := c.items[mapKey]; found {
 		entry := el.Value.(*listCacheEntry)
-		if time.Since(entry.fetchedAt) < c.ttl {
+		if c.ttl <= 0 || time.Since(entry.lastAccessed) < c.ttl {
+			entry.lastAccessed = time.Now()
 			c.lru.MoveToFront(el)
 			c.mu.Unlock()
 			atomic.AddUint64(&c.hits, 1)
@@ -169,11 +174,13 @@ func (c *ListCache) ListPage(ctx context.Context, prefix string, opts storage.Li
 
 	// 3. Admit to cache
 	c.mu.Lock()
+	now = time.Now()
 	if el, found := c.items[mapKey]; found {
 		entry := el.Value.(*listCacheEntry)
 		entry.items = copyMetas(metas)
 		entry.nextCursor = next
-		entry.fetchedAt = time.Now()
+		entry.fetchedAt = now
+		entry.lastAccessed = now
 		c.lru.MoveToFront(el)
 	} else {
 		// Evict oldest if capacity reached
@@ -189,10 +196,11 @@ func (c *ListCache) ListPage(ctx context.Context, prefix string, opts storage.Li
 		}
 
 		c.items[mapKey] = c.lru.PushFront(&listCacheEntry{
-			key:        k,
-			items:      copyMetas(metas),
-			nextCursor: next,
-			fetchedAt:  time.Now(),
+			key:          k,
+			items:        copyMetas(metas),
+			nextCursor:   next,
+			fetchedAt:    now,
+			lastAccessed: now,
 		})
 	}
 	c.mu.Unlock()

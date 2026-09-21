@@ -209,7 +209,7 @@ func (m *Manager) Get(ctx context.Context, key string) (*storage.Object, error) 
 	shard.mu.Lock()
 	if el, found := shard.items[key]; found {
 		item := el.Value.(*Item)
-		if ttl <= 0 || time.Since(item.FetchedAt) < ttl {
+		if ttl <= 0 || time.Since(item.LastAccessed) < ttl {
 			obj := item.Object
 			item.LastAccessed = time.Now()
 			shard.lru.MoveToFront(el)

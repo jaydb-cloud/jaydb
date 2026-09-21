@@ -133,6 +133,45 @@ func TestListCache_TTLExpiration(t *testing.T) {
 	}
 }
 
+func TestListCache_ReadsRefreshEvictionTime(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewDriver()
+	_, _ = store.Put(ctx, "k1", []byte("v1"), "")
+
+	mock := &countingDriver{Driver: store}
+	lc := cache.NewListCache(mock, cache.ListConfig{
+		TTL:      60 * time.Millisecond,
+		MaxPages: 10,
+	})
+
+	// Initial load: fetches from driver
+	_, _, _ = lc.ListPage(ctx, "", storage.ListOptions{Limit: 10})
+	if mock.listCalls.Load() != 1 {
+		t.Fatalf("initial load failed, count=%d", mock.listCalls.Load())
+	}
+
+	// Repeated reads at 25ms intervals.
+	// Total elapsed: 4 * 25ms = 100ms, which exceeds the 60ms TTL.
+	// Because each read refreshes the eviction time, the entry MUST NOT expire!
+	for i := 0; i < 4; i++ {
+		time.Sleep(25 * time.Millisecond)
+		_, _, err := lc.ListPage(ctx, "", storage.ListOptions{Limit: 10})
+		if err != nil {
+			t.Fatalf("read %d failed: %v", i, err)
+		}
+		if mock.listCalls.Load() != 1 {
+			t.Fatalf("read %d re-fetched from driver; reads must refresh eviction time", i)
+		}
+	}
+
+	// Now wait 70ms without reading: entry should expire due to idle TTL
+	time.Sleep(70 * time.Millisecond)
+	_, _, _ = lc.ListPage(ctx, "", storage.ListOptions{Limit: 10})
+	if mock.listCalls.Load() != 2 {
+		t.Fatalf("expected storage fetch after idle timeout, count=%d", mock.listCalls.Load())
+	}
+}
+
 type delayedDriver struct {
 	storage.Driver
 	listCalls atomic.Uint64
