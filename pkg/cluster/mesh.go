@@ -347,6 +347,9 @@ func portFromAddr(addr net.Addr) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("parse port %q: %w", portStr, err)
 	}
+	if port < 0 || port > 65535 {
+		return 0, fmt.Errorf("port out of range %q", portStr)
+	}
 	return port, nil
 }
 
