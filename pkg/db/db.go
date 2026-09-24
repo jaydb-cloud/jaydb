@@ -682,6 +682,11 @@ func (d *database) Close() error {
 	return d.storageDrive.Close()
 }
 
+// ClusterNode returns the configured ClusterNode, or nil if running in standalone mode.
+func (d *database) ClusterNode() *cluster.Node {
+	return d.opts.ClusterNode
+}
+
 func mapErrorString(errStr string) error {
 	switch errStr {
 	case storage.ErrNotFound.Error():
