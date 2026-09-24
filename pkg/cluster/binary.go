@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"sync"
 	"time"
 
@@ -35,12 +36,43 @@ func writeBinaryReq(w io.Writer, req InterQueryReq) error {
 	etagB := []byte(req.ExpectedETag)
 	valB := req.Value
 
-	totalLen := 1 + 1 + 1 + 8 +
-		2 + len(authB) +
-		2 + len(nsB) +
-		2 + len(keyB) +
-		2 + len(etagB) +
-		4 + len(valB)
+	if len(authB) > math.MaxUint16 {
+		return errors.New("jaydb cluster: auth too large")
+	}
+	if len(nsB) > math.MaxUint16 {
+		return errors.New("jaydb cluster: namespace too large")
+	}
+	if len(keyB) > math.MaxUint16 {
+		return errors.New("jaydb cluster: key too large")
+	}
+	if len(etagB) > math.MaxUint16 {
+		return errors.New("jaydb cluster: expected etag too large")
+	}
+	if len(valB) > math.MaxUint32 {
+		return errors.New("jaydb cluster: value too large")
+	}
+
+	totalLen := 0
+	addPart := func(n int) error {
+		if n < 0 || totalLen > math.MaxInt-n {
+			return errors.New("jaydb cluster: request too large")
+		}
+		totalLen += n
+		return nil
+	}
+
+	for _, n := range []int{
+		1, 1, 1, 8,
+		2, len(authB),
+		2, len(nsB),
+		2, len(keyB),
+		2, len(etagB),
+		4, len(valB),
+	} {
+		if err := addPart(n); err != nil {
+			return err
+		}
+	}
 
 	var buf []byte
 	var poolBuf *[]byte
