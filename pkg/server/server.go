@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/avivklas/jaydb/pkg/cluster"
 	"github.com/avivklas/jaydb/pkg/db"
 	"github.com/avivklas/jaydb/pkg/metrics"
 	"github.com/avivklas/jaydb/pkg/sharding"
@@ -20,15 +21,19 @@ import (
 
 // Server encapsulates the FastHTTP server wrapper around the embedded DB engine.
 type Server struct {
-	db       db.DB
-	listener net.Listener
+	db          db.DB
+	ring        *sharding.Ring
+	nodeAddr    string
+	clusterNode *cluster.Node
+	listener    net.Listener
 }
 
 // Options configures the server instance.
 type Options struct {
-	DB       db.DB
-	Ring     *sharding.Ring // Deprecated: inter-node routing is handled automatically by db.DB via the QUIC cluster mesh.
-	NodeAddr string         // Deprecated: node address is managed by db.DB and cluster.Node.
+	DB          db.DB
+	Ring        *sharding.Ring // Partition ring for cluster key distribution.
+	NodeAddr    string         // Address of this node (defaults to ClusterNode.SelfMeshAddr()).
+	ClusterNode *cluster.Node  // Cluster mesh node for inter-node query forwarding.
 }
 
 // NewServer initializes a new FastHTTP server wrapping the embedded DB.
@@ -36,8 +41,29 @@ func NewServer(opts Options) (*Server, error) {
 	if opts.DB == nil {
 		return nil, fmt.Errorf("server: embedded DB instance is required")
 	}
+
+	clusterNode := opts.ClusterNode
+	if clusterNode == nil {
+		if cnp, ok := opts.DB.(interface{ ClusterNode() *cluster.Node }); ok {
+			clusterNode = cnp.ClusterNode()
+		}
+	}
+
+	ring := opts.Ring
+	if ring == nil && clusterNode != nil {
+		ring = clusterNode.Ring()
+	}
+
+	nodeAddr := opts.NodeAddr
+	if nodeAddr == "" && clusterNode != nil {
+		nodeAddr = clusterNode.SelfMeshAddr()
+	}
+
 	return &Server{
-		db: opts.DB,
+		db:          opts.DB,
+		ring:        ring,
+		nodeAddr:    nodeAddr,
+		clusterNode: clusterNode,
 	}, nil
 }
 
@@ -93,6 +119,16 @@ func (s *Server) HandleRequest(ctx *fasthttp.RequestCtx) {
 			}
 		}
 
+		// Inter-node forwarding check via TCP cluster mesh
+		if s.clusterNode != nil && s.ring != nil {
+			targetNode := s.ring.GetNode(key)
+			selfAddr := s.clusterNode.SelfMeshAddr()
+			if targetNode != "" && targetNode != selfAddr {
+				s.forwardViaMesh(ctx, targetNode, key)
+				return
+			}
+		}
+
 		switch string(ctx.Method()) {
 		case fasthttp.MethodGet:
 			s.handleGet(ctx, key)
@@ -132,6 +168,157 @@ func (s *Server) getPathPrefix(path string) string {
 	return "unknown"
 }
 
+
+func (s *Server) forwardViaMesh(ctx *fasthttp.RequestCtx, targetNode string, key string) {
+	reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	switch string(ctx.Method()) {
+	case fasthttp.MethodGet:
+		s.forwardGetViaMesh(ctx, reqCtx, targetNode, key)
+	case fasthttp.MethodPut:
+		s.forwardPutViaMesh(ctx, reqCtx, targetNode, key)
+	case fasthttp.MethodDelete:
+		s.forwardDeleteViaMesh(ctx, reqCtx, targetNode, key)
+	default:
+		ctx.Error("method not allowed", fasthttp.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) forwardGetViaMesh(ctx *fasthttp.RequestCtx, reqCtx context.Context, targetNode, key string) {
+	start := time.Now()
+	resp, err := s.clusterNode.ExecuteInterQuery(reqCtx, targetNode, cluster.InterQueryReq{
+		Op:  cluster.OpGet,
+		Key: key,
+	})
+	duration := time.Since(start).Seconds()
+
+	if err != nil {
+		metrics.RecordDBOperation("get", "error", duration)
+		ctx.Error(fmt.Sprintf("mesh forward error: %v", err), fasthttp.StatusBadGateway)
+		return
+	}
+	if resp.Err != "" {
+		metrics.RecordDBOperation("get", "error", duration)
+		if resp.Err == storage.ErrNotFound.Error() {
+			ctx.Error("document not found", fasthttp.StatusNotFound)
+			return
+		}
+		ctx.Error(resp.Err, fasthttp.StatusInternalServerError)
+		return
+	}
+	if resp.Object == nil {
+		metrics.RecordDBOperation("get", "error", duration)
+		ctx.Error("document not found", fasthttp.StatusNotFound)
+		return
+	}
+
+	metrics.RecordDBOperation("get", "success", duration)
+	metrics.ObserveObjectSize(len(resp.Object.Value))
+
+	ctx.Response.Header.Set("ETag", resp.Object.ETag)
+	ctx.SetContentType("application/json")
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	ctx.SetBody(resp.Object.Value)
+}
+
+func (s *Server) forwardPutViaMesh(ctx *fasthttp.RequestCtx, reqCtx context.Context, targetNode, key string) {
+	body := ctx.PostBody()
+	if len(body) == 0 {
+		ctx.Error("request body is required", fasthttp.StatusBadRequest)
+		return
+	}
+	const maxBodySize = 10 * 1024 * 1024
+	if len(body) > maxBodySize {
+		ctx.Error("request body too large (max 10MB)", fasthttp.StatusRequestEntityTooLarge)
+		return
+	}
+
+	ifMatch := string(ctx.Request.Header.Peek("If-Match"))
+	ifNoneMatch := string(ctx.Request.Header.Peek("If-None-Match"))
+
+	expectedETag := ifMatch
+	if ifNoneMatch == "*" {
+		expectedETag = storage.MatchAnyETag
+	}
+
+	start := time.Now()
+	resp, err := s.clusterNode.ExecuteInterQuery(reqCtx, targetNode, cluster.InterQueryReq{
+		Op:           cluster.OpPut,
+		Key:          key,
+		Value:        body,
+		ExpectedETag: expectedETag,
+	})
+	duration := time.Since(start).Seconds()
+
+	if err != nil {
+		metrics.RecordDBOperation("put", "error", duration)
+		ctx.Error(fmt.Sprintf("mesh forward error: %v", err), fasthttp.StatusBadGateway)
+		return
+	}
+	if resp.Err != "" {
+		metrics.RecordDBOperation("put", "error", duration)
+		if resp.Err == storage.ErrVersionMismatch.Error() || resp.Err == storage.ErrAlreadyExists.Error() {
+			ctx.Error("CAS precondition failed: "+resp.Err, fasthttp.StatusPreconditionFailed)
+			return
+		}
+		ctx.Error(resp.Err, fasthttp.StatusInternalServerError)
+		return
+	}
+	if resp.Object == nil {
+		metrics.RecordDBOperation("put", "error", duration)
+		ctx.Error("put returned no object", fasthttp.StatusInternalServerError)
+		return
+	}
+
+	metrics.RecordDBOperation("put", "success", duration)
+	metrics.ObserveObjectSize(len(body))
+
+	ctx.Response.Header.Set("ETag", resp.Object.ETag)
+	ctx.SetContentType("application/json")
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	meta := db.Meta{
+		Key:     resp.Object.Key,
+		ETag:    resp.Object.ETag,
+		ModTime: resp.Object.ModTime,
+	}
+	respBody, _ := json.Marshal(meta)
+	ctx.SetBody(respBody)
+}
+
+func (s *Server) forwardDeleteViaMesh(ctx *fasthttp.RequestCtx, reqCtx context.Context, targetNode, key string) {
+	ifMatch := string(ctx.Request.Header.Peek("If-Match"))
+
+	start := time.Now()
+	resp, err := s.clusterNode.ExecuteInterQuery(reqCtx, targetNode, cluster.InterQueryReq{
+		Op:           cluster.OpDelete,
+		Key:          key,
+		ExpectedETag: ifMatch,
+	})
+	duration := time.Since(start).Seconds()
+
+	if err != nil {
+		metrics.RecordDBOperation("delete", "error", duration)
+		ctx.Error(fmt.Sprintf("mesh forward error: %v", err), fasthttp.StatusBadGateway)
+		return
+	}
+	if resp.Err != "" {
+		metrics.RecordDBOperation("delete", "error", duration)
+		if resp.Err == storage.ErrNotFound.Error() {
+			ctx.Error("document not found", fasthttp.StatusNotFound)
+			return
+		}
+		if resp.Err == storage.ErrVersionMismatch.Error() {
+			ctx.Error("CAS precondition failed", fasthttp.StatusPreconditionFailed)
+			return
+		}
+		ctx.Error(resp.Err, fasthttp.StatusInternalServerError)
+		return
+	}
+
+	metrics.RecordDBOperation("delete", "success", duration)
+	ctx.SetStatusCode(fasthttp.StatusNoContent)
+}
 
 func (s *Server) handleGet(ctx *fasthttp.RequestCtx, key string) {
 	// Use request context with timeout instead of Background()

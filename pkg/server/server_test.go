@@ -1,10 +1,16 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
+	"time"
 
+	"github.com/avivklas/jaydb/pkg/cluster"
 	"github.com/avivklas/jaydb/pkg/db"
+	"github.com/avivklas/jaydb/pkg/sharding"
+	"github.com/avivklas/jaydb/pkg/storage"
 	"github.com/avivklas/jaydb/pkg/storage/memory"
 	"github.com/valyala/fasthttp"
 )
@@ -153,6 +159,152 @@ func TestServer_NoHTTPProxying(t *testing.T) {
 
 	if ctx.Response.StatusCode() != fasthttp.StatusOK {
 		t.Fatalf("expected HTTP 200, got %d", ctx.Response.StatusCode())
+	}
+}
+
+func TestServer_ForwardsViaTCPMesh(t *testing.T) {
+	ring := sharding.NewRing(3, 2)
+
+	// 1. Setup Node 1
+	mem1 := memory.NewDriver()
+	db1, err := db.Open(db.Options{
+		Storage:       mem1,
+		ShardingDepth: 2,
+		Ring:          ring,
+	})
+	if err != nil {
+		t.Fatalf("db1 open error: %v", err)
+	}
+	defer db1.Close()
+
+	node1, err := cluster.NewNode(cluster.NodeConfig{
+		NodeName:    "node-1",
+		BindAddr:    "127.0.0.1",
+		BindPort:    0,
+		MeshPort:    0,
+		Ring:        ring,
+		DBHandler:   db1,
+		PoolSize:    8,
+		DialTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("node1 error: %v", err)
+	}
+	defer node1.Close()
+
+	// 2. Setup Node 2
+	mem2 := memory.NewDriver()
+	db2, err := db.Open(db.Options{
+		Storage:       mem2,
+		ShardingDepth: 2,
+		Ring:          ring,
+	})
+	if err != nil {
+		t.Fatalf("db2 open error: %v", err)
+	}
+	defer db2.Close()
+
+	node2, err := cluster.NewNode(cluster.NodeConfig{
+		NodeName:    "node-2",
+		BindAddr:    "127.0.0.1",
+		BindPort:    0,
+		MeshPort:    0,
+		JoinAddrs:   []string{node1.GossipAddr()},
+		Ring:        ring,
+		DBHandler:   db2,
+		PoolSize:    8,
+		DialTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("node2 error: %v", err)
+	}
+	defer node2.Close()
+
+	time.Sleep(1 * time.Second)
+
+	// Create Server for Node 2 with ClusterNode configured
+	srv2, err := NewServer(Options{
+		DB:          db2,
+		ClusterNode: node2,
+	})
+	if err != nil {
+		t.Fatalf("srv2 create error: %v", err)
+	}
+
+	// Pick a key owned by Node 1
+	node1Addr := node1.SelfMeshAddr()
+	var targetKey string
+	for i := 0; i < 1000; i++ {
+		cand := fmt.Sprintf("server-test-key-%d", i)
+		if ring.GetNode(cand) == node1Addr {
+			targetKey = cand
+			break
+		}
+	}
+	if targetKey == "" {
+		t.Fatalf("failed to find key owned by node1")
+	}
+
+	// 1. PUT request sent to Node 2 for key owned by Node 1
+	putCtx := &fasthttp.RequestCtx{}
+	putCtx.Request.Header.SetMethod(fasthttp.MethodPut)
+	putCtx.Request.SetRequestURI(fmt.Sprintf("/v1/kv/%s", targetKey))
+	putCtx.Request.SetBodyString(`{"server":"mesh"}`)
+	srv2.HandleRequest(putCtx)
+
+	if putCtx.Response.StatusCode() != fasthttp.StatusOK {
+		t.Fatalf("expected HTTP 200 on mesh forwarded PUT, got %d: %s", putCtx.Response.StatusCode(), putCtx.Response.Body())
+	}
+	etag := string(putCtx.Response.Header.Peek("ETag"))
+	if etag == "" {
+		t.Fatalf("expected ETag in PUT response")
+	}
+
+	// Verify the object is stored on Node 1
+	obj, err := db1.GetRaw(context.Background(), targetKey)
+	if err != nil || obj == nil {
+		t.Fatalf("expected object on node 1, got error: %v", err)
+	}
+	if string(obj.Value) != `{"server":"mesh"}` {
+		t.Fatalf("expected object value match, got %s", string(obj.Value))
+	}
+
+	// Verify Node 2 does NOT cache this forwarded key
+	items2, _ := db2.Cache().GetCacheSize()
+	if items2 != 0 {
+		t.Fatalf("forwarding node 2 should have 0 cached items, got %d", items2)
+	}
+
+	// 2. GET request sent to Node 2 for key owned by Node 1
+	getCtx := &fasthttp.RequestCtx{}
+	getCtx.Request.Header.SetMethod(fasthttp.MethodGet)
+	getCtx.Request.SetRequestURI(fmt.Sprintf("/v1/kv/%s", targetKey))
+	srv2.HandleRequest(getCtx)
+
+	if getCtx.Response.StatusCode() != fasthttp.StatusOK {
+		t.Fatalf("expected HTTP 200 on mesh forwarded GET, got %d: %s", getCtx.Response.StatusCode(), getCtx.Response.Body())
+	}
+	if string(getCtx.Response.Body()) != `{"server":"mesh"}` {
+		t.Fatalf("expected body match, got %s", string(getCtx.Response.Body()))
+	}
+	if string(getCtx.Response.Header.Peek("ETag")) != etag {
+		t.Fatalf("expected ETag match, got %s", getCtx.Response.Header.Peek("ETag"))
+	}
+
+	// 3. DELETE request sent to Node 2 for key owned by Node 1
+	delCtx := &fasthttp.RequestCtx{}
+	delCtx.Request.Header.SetMethod(fasthttp.MethodDelete)
+	delCtx.Request.SetRequestURI(fmt.Sprintf("/v1/kv/%s", targetKey))
+	srv2.HandleRequest(delCtx)
+
+	if delCtx.Response.StatusCode() != fasthttp.StatusNoContent {
+		t.Fatalf("expected HTTP 204 on mesh forwarded DELETE, got %d: %s", delCtx.Response.StatusCode(), delCtx.Response.Body())
+	}
+
+	// Verify object is now deleted on Node 1
+	_, err = db1.GetRaw(context.Background(), targetKey)
+	if err != storage.ErrNotFound {
+		t.Fatalf("expected ErrNotFound on node 1 after delete, got %v", err)
 	}
 }
 
