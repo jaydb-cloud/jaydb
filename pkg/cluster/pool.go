@@ -24,8 +24,8 @@ const (
 // PeerPoolConfig specifies connection parameters for a single peer node.
 type PeerPoolConfig struct {
 	TargetAddr        string
-	TLSConfig         *tls.Config   // Deprecated: kept for backwards compatibility
-	QUICConfig        any           // Deprecated: kept for backwards compatibility
+	TLSConfig         *tls.Config // Deprecated: kept for backwards compatibility
+	QUICConfig        any         // Deprecated: kept for backwards compatibility
 	PoolSize          int
 	DialTimeout       time.Duration
 	StreamOpenTimeout time.Duration // Deprecated: kept for backwards compatibility

@@ -168,7 +168,6 @@ func (s *Server) getPathPrefix(path string) string {
 	return "unknown"
 }
 
-
 func (s *Server) forwardViaMesh(ctx *fasthttp.RequestCtx, targetNode string, key string) {
 	reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

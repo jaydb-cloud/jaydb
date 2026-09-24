@@ -564,4 +564,3 @@ func TestCacheLocationInCluster(t *testing.T) {
 	t.Logf("Cache verification passed: Node 1 (owner) hits=%d items=%d, Node 2 (handler) hits=%d items=%d",
 		newHits1, items1, newHits2, afterItems2)
 }
-

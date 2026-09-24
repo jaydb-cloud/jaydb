@@ -307,4 +307,3 @@ func TestServer_ForwardsViaTCPMesh(t *testing.T) {
 		t.Fatalf("expected ErrNotFound on node 1 after delete, got %v", err)
 	}
 }
-
