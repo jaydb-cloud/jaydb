@@ -5,16 +5,14 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
-	"sync/atomic"
 	"time"
-
-	"github.com/quic-go/quic-go"
 )
 
 var (
 	ErrPeerPoolClosed = errors.New("jaydb cluster: peer pool is closed")
-	ErrNoLiveConn     = errors.New("jaydb cluster: no live QUIC connection available in pool")
+	ErrNoLiveConn     = errors.New("jaydb cluster: no live connection available in pool")
 )
 
 const (
@@ -26,20 +24,18 @@ const (
 // PeerPoolConfig specifies connection parameters for a single peer node.
 type PeerPoolConfig struct {
 	TargetAddr        string
-	TLSConfig         *tls.Config
-	QUICConfig        *quic.Config
+	TLSConfig         *tls.Config   // Deprecated: kept for backwards compatibility
+	QUICConfig        any           // Deprecated: kept for backwards compatibility
 	PoolSize          int
 	DialTimeout       time.Duration
-	StreamOpenTimeout time.Duration
+	StreamOpenTimeout time.Duration // Deprecated: kept for backwards compatibility
 }
 
-// PeerPool manages a proactive pool of pre-opened QUIC connections to a single remote peer.
+// PeerPool manages a pool of persistent, reused TCP connections to a single remote peer.
 type PeerPool struct {
 	cfg        PeerPoolConfig
 	mu         sync.RWMutex
-	conns      []*quic.Conn
-	dialLocks  []sync.Mutex
-	rrCounter  atomic.Uint64
+	conns      chan net.Conn
 	closed     bool
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -54,15 +50,11 @@ func NewPeerPool(parentCtx context.Context, cfg PeerPoolConfig, parentNode *Node
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = DefaultDialTimeout
 	}
-	if cfg.StreamOpenTimeout <= 0 {
-		cfg.StreamOpenTimeout = DefaultStreamOpenTimeout
-	}
 
 	ctx, cancel := context.WithCancel(parentCtx)
 	p := &PeerPool{
 		cfg:        cfg,
-		conns:      make([]*quic.Conn, cfg.PoolSize),
-		dialLocks:  make([]sync.Mutex, cfg.PoolSize),
+		conns:      make(chan net.Conn, cfg.PoolSize),
 		ctx:        ctx,
 		cancel:     cancel,
 		parentNode: parentNode,
@@ -76,7 +68,7 @@ func NewPeerPool(parentCtx context.Context, cfg PeerPoolConfig, parentNode *Node
 	return p
 }
 
-// EnsureConnected ensures all slots in the pool have active, live QUIC connections.
+// EnsureConnected warms up the pool with active, pre-opened TCP connections.
 func (p *PeerPool) EnsureConnected(ctx context.Context) error {
 	p.mu.RLock()
 	if p.closed {
@@ -85,207 +77,118 @@ func (p *PeerPool) EnsureConnected(ctx context.Context) error {
 	}
 	p.mu.RUnlock()
 
-	var firstErr error
+	dialer := &net.Dialer{
+		Timeout:   p.cfg.DialTimeout,
+		KeepAlive: 15 * time.Second,
+	}
+
 	for i := 0; i < p.cfg.PoolSize; i++ {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-p.ctx.Done():
-			return ErrPeerPoolClosed
 		default:
 		}
 
-		if err := p.ensureSlotConnected(ctx, i); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
+		// Don't dial if channel is already full
+		if len(p.conns) >= p.cfg.PoolSize {
+			return nil
+		}
+
+		conn, err := dialer.DialContext(ctx, "tcp", p.cfg.TargetAddr)
+		if err != nil {
+			return err
+		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+		}
+
+		select {
+		case p.conns <- conn:
+		default:
+			_ = conn.Close()
+			return nil
 		}
 	}
-	return firstErr
-}
-
-func (p *PeerPool) ensureSlotConnected(ctx context.Context, slot int) error {
-	p.mu.RLock()
-	if p.closed {
-		p.mu.RUnlock()
-		return ErrPeerPoolClosed
-	}
-	conn := p.conns[slot]
-	if conn != nil && conn.Context().Err() == nil {
-		p.mu.RUnlock()
-		return nil // Still healthy
-	}
-	p.mu.RUnlock()
-
-	// Acquire per-slot dial lock so multiple callers don't dial duplicate connections for the same slot
-	p.dialLocks[slot].Lock()
-	defer p.dialLocks[slot].Unlock()
-
-	p.mu.RLock()
-	if p.closed {
-		p.mu.RUnlock()
-		return ErrPeerPoolClosed
-	}
-	conn = p.conns[slot]
-	if conn != nil && conn.Context().Err() == nil {
-		p.mu.RUnlock()
-		return nil
-	}
-	p.mu.RUnlock()
-
-	// Dial with bounded timeout
-	dialCtx, cancel := context.WithTimeout(ctx, p.cfg.DialTimeout)
-	defer cancel()
-
-	newConn, err := quic.DialAddr(dialCtx, p.cfg.TargetAddr, p.cfg.TLSConfig, p.cfg.QUICConfig)
-	if err != nil {
-		return fmt.Errorf("quic dial %s (slot %d): %w", p.cfg.TargetAddr, slot, err)
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
-		_ = newConn.CloseWithError(0, "pool closed during dial")
-		return ErrPeerPoolClosed
-	}
-
-	// If old conn existed, ensure it is closed
-	if p.conns[slot] != nil {
-		_ = p.conns[slot].CloseWithError(0, "replacing stale connection")
-	}
-	p.conns[slot] = newConn
 	return nil
 }
 
-// GetStream retrieves an open bidirectional stream on a pre-opened connection from the pool.
-// Returns the stream, a drop callback (to mark connection stale on transport error), and any error.
-func (p *PeerPool) GetStream(ctx context.Context) (*quic.Stream, func(), error) {
+// GetConn retrieves an idle TCP connection from the pool, or dials a new one if none are available.
+func (p *PeerPool) GetConn(ctx context.Context) (net.Conn, error) {
 	p.mu.RLock()
 	if p.closed {
 		p.mu.RUnlock()
-		return nil, nil, ErrPeerPoolClosed
+		return nil, ErrPeerPoolClosed
 	}
 	p.mu.RUnlock()
 
-	// Try existing live connections first using round-robin
-	startIdx := int(p.rrCounter.Add(1) % uint64(p.cfg.PoolSize))
-	for attempt := 0; attempt < p.cfg.PoolSize; attempt++ {
-		slot := (startIdx + attempt) % p.cfg.PoolSize
-
-		p.mu.RLock()
-		conn := p.conns[slot]
-		p.mu.RUnlock()
-
-		if conn == nil {
-			continue
-		}
-
-		if conn.Context().Err() != nil {
-			// Stale connection, drop and trigger background reconnect
-			p.DropSlot(slot, conn)
-			continue
-		}
-
-		openCtx, cancel := context.WithTimeout(ctx, p.cfg.StreamOpenTimeout)
-		stream, err := conn.OpenStreamSync(openCtx)
-		cancel()
-
-		if err == nil {
-			dropFunc := func() {
-				if conn.Context().Err() != nil {
-					p.DropSlot(slot, conn)
-				}
+	for {
+		select {
+		case conn := <-p.conns:
+			return conn, nil
+		default:
+			// No idle connection available; dial a fresh one
+			dialer := &net.Dialer{
+				Timeout:   p.cfg.DialTimeout,
+				KeepAlive: 15 * time.Second,
 			}
-			return stream, dropFunc, nil
-		}
-
-		// Only drop the connection if the socket itself died; transient stream open
-		// timeout or rate limit does NOT kill the underlying connection.
-		if conn.Context().Err() != nil {
-			p.DropSlot(slot, conn)
-		}
-	}
-
-	// If all pooled connections were dead or empty, attempt an on-demand reconnect for startIdx
-	p.mu.RLock()
-	conn := p.conns[startIdx]
-	p.mu.RUnlock()
-
-	if conn == nil || conn.Context().Err() != nil {
-		if err := p.ensureSlotConnected(ctx, startIdx); err != nil {
-			return nil, nil, err
-		}
-		p.mu.RLock()
-		conn = p.conns[startIdx]
-		p.mu.RUnlock()
-	}
-
-	if conn == nil || conn.Context().Err() != nil {
-		return nil, nil, ErrNoLiveConn
-	}
-
-	openCtx, cancel := context.WithTimeout(ctx, p.cfg.StreamOpenTimeout)
-	stream, err := conn.OpenStreamSync(openCtx)
-	cancel()
-	if err != nil {
-		if conn.Context().Err() != nil {
-			p.DropSlot(startIdx, conn)
-		}
-		return nil, nil, fmt.Errorf("quic open stream to %s: %w", p.cfg.TargetAddr, err)
-	}
-
-	dropFunc := func() {
-		if conn.Context().Err() != nil {
-			p.DropSlot(startIdx, conn)
+			conn, err := dialer.DialContext(ctx, "tcp", p.cfg.TargetAddr)
+			if err != nil {
+				return nil, fmt.Errorf("dial peer %s: %w", p.cfg.TargetAddr, err)
+			}
+			if tc, ok := conn.(*net.TCPConn); ok {
+				_ = tc.SetNoDelay(true)
+			}
+			return conn, nil
 		}
 	}
-	return stream, dropFunc, nil
 }
 
-// DropSlot removes a connection from a slot if it matches the current entry and triggers background healing.
-func (p *PeerPool) DropSlot(slot int, conn *quic.Conn) {
-	p.mu.Lock()
-	if p.conns[slot] != conn {
-		p.mu.Unlock()
+// PutConn returns an active, healthy TCP connection back to the pool.
+func (p *PeerPool) PutConn(conn net.Conn) {
+	if conn == nil {
 		return
 	}
-	p.conns[slot] = nil
-	closed := p.closed
-	p.mu.Unlock()
 
-	if conn != nil {
-		_ = conn.CloseWithError(0, "dropping stale connection")
-	}
-
-	if !closed {
-		// Asynchronously heal the dropped slot exactly once
-		go func() {
-			_ = p.ensureSlotConnected(p.ctx, slot)
-		}()
-	}
-}
-
-// LiveCount returns the number of currently healthy connections in the pool.
-func (p *PeerPool) LiveCount() int {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
-		return 0
+	closed := p.closed
+	p.mu.RUnlock()
+
+	if closed {
+		_ = conn.Close()
+		return
 	}
-	count := 0
-	for _, c := range p.conns {
-		if c != nil {
-			select {
-			case <-c.Context().Done():
-			default:
-				count++
-			}
-		}
+
+	select {
+	case p.conns <- conn:
+	default:
+		// Pool is full; close excess connection
+		_ = conn.Close()
 	}
-	return count
 }
 
-// Close gracefully closes all QUIC connections in the pool.
+// DropConn closes and discards a failed connection.
+func (p *PeerPool) DropConn(conn net.Conn) {
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+// isConnClosed probes if a socket has been closed or reset by the remote peer.
+func isConnClosed(conn net.Conn) bool {
+	_ = conn.SetReadDeadline(time.Now())
+	var b [1]byte
+	n, err := conn.Read(b[:])
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			return false // No data ready, connection is still alive
+		}
+		return true // EOF or connection reset
+	}
+	return n > 0 // Unexpected data waiting on idle connection
+}
+
+// Close gracefully closes all connections in the pool.
 func (p *PeerPool) Close() {
 	p.mu.Lock()
 	if p.closed {
@@ -294,17 +197,11 @@ func (p *PeerPool) Close() {
 	}
 	p.closed = true
 	p.cancel()
-	conns := make([]*quic.Conn, len(p.conns))
-	copy(conns, p.conns)
-	for i := range p.conns {
-		p.conns[i] = nil
-	}
 	p.mu.Unlock()
 
-	for _, c := range conns {
-		if c != nil {
-			_ = c.CloseWithError(0, "peer pool closed")
-		}
+	close(p.conns)
+	for conn := range p.conns {
+		_ = conn.Close()
 	}
 }
 
@@ -313,10 +210,10 @@ type MeshPool struct {
 	mu         sync.RWMutex
 	peers      map[string]*PeerPool
 	poolSize   int
-	tlsConfig  *tls.Config
-	quicConfig *quic.Config
+	tlsConfig  *tls.Config // Deprecated: kept for backwards compatibility
+	quicConfig any         // Deprecated: kept for backwards compatibility
 	dialTo     time.Duration
-	streamTo   time.Duration
+	streamTo   time.Duration // Deprecated: kept for backwards compatibility
 	ctx        context.Context
 	cancel     context.CancelFunc
 	parentNode *Node
@@ -336,16 +233,11 @@ func NewMeshPool(parentCtx context.Context, poolSize int, tlsConfig *tls.Config,
 
 	ctx, cancel := context.WithCancel(parentCtx)
 	return &MeshPool{
-		peers:     make(map[string]*PeerPool),
-		poolSize:  poolSize,
-		tlsConfig: tlsConfig,
-		dialTo:    dialTo,
-		streamTo:  streamTo,
-		quicConfig: &quic.Config{
-			MaxIncomingStreams: 2000,
-			MaxIdleTimeout:     30 * time.Second,
-			KeepAlivePeriod:    10 * time.Second,
-		},
+		peers:      make(map[string]*PeerPool),
+		poolSize:   poolSize,
+		tlsConfig:  tlsConfig,
+		dialTo:     dialTo,
+		streamTo:   streamTo,
 		ctx:        ctx,
 		cancel:     cancel,
 		parentNode: parentNode,
@@ -372,12 +264,9 @@ func (m *MeshPool) AddPeer(targetAddr string) {
 	}
 
 	cfg := PeerPoolConfig{
-		TargetAddr:        targetAddr,
-		TLSConfig:         m.tlsConfig,
-		QUICConfig:        m.quicConfig,
-		PoolSize:          m.poolSize,
-		DialTimeout:       m.dialTo,
-		StreamOpenTimeout: m.streamTo,
+		TargetAddr:  targetAddr,
+		PoolSize:    m.poolSize,
+		DialTimeout: m.dialTo,
 	}
 
 	m.peers[targetAddr] = NewPeerPool(m.ctx, cfg, m.parentNode)
@@ -397,11 +286,11 @@ func (m *MeshPool) RemovePeer(targetAddr string) {
 	}
 }
 
-// GetStream retrieves an active pre-opened stream to targetAddr.
-func (m *MeshPool) GetStream(ctx context.Context, targetAddr string) (*quic.Stream, func(), error) {
+// GetConn retrieves an active connection to targetAddr.
+func (m *MeshPool) GetConn(ctx context.Context, targetAddr string) (net.Conn, error) {
 	select {
 	case <-m.ctx.Done():
-		return nil, nil, ErrPeerPoolClosed
+		return nil, ErrPeerPoolClosed
 	default:
 	}
 
@@ -410,7 +299,6 @@ func (m *MeshPool) GetStream(ctx context.Context, targetAddr string) (*quic.Stre
 	m.mu.RUnlock()
 
 	if !exists {
-		// If not registered yet, register and dial
 		m.AddPeer(targetAddr)
 		m.mu.RLock()
 		pool = m.peers[targetAddr]
@@ -420,13 +308,58 @@ func (m *MeshPool) GetStream(ctx context.Context, targetAddr string) (*quic.Stre
 	if pool == nil {
 		select {
 		case <-m.ctx.Done():
-			return nil, nil, ErrPeerPoolClosed
+			return nil, ErrPeerPoolClosed
 		default:
 		}
-		return nil, nil, fmt.Errorf("peer pool for %s not found", targetAddr)
+		return nil, fmt.Errorf("peer pool for %s not found", targetAddr)
 	}
 
-	return pool.GetStream(ctx)
+	return pool.GetConn(ctx)
+}
+
+// GetStream is a compatibility wrapper for GetConn.
+func (m *MeshPool) GetStream(ctx context.Context, targetAddr string) (net.Conn, func(), error) {
+	conn, err := m.GetConn(ctx, targetAddr)
+	if err != nil {
+		return nil, nil, err
+	}
+	dropFunc := func() {
+		m.DropConn(targetAddr, conn)
+	}
+	return conn, dropFunc, nil
+}
+
+// PeerCount returns the count of active peer pools.
+func (m *MeshPool) PeerCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.peers)
+}
+
+// PutConn returns an active connection to targetAddr's pool.
+func (m *MeshPool) PutConn(targetAddr string, conn net.Conn) {
+	m.mu.RLock()
+	pool, exists := m.peers[targetAddr]
+	m.mu.RUnlock()
+
+	if exists && pool != nil {
+		pool.PutConn(conn)
+	} else if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+// DropConn closes and discards a failed connection for targetAddr.
+func (m *MeshPool) DropConn(targetAddr string, conn net.Conn) {
+	m.mu.RLock()
+	pool, exists := m.peers[targetAddr]
+	m.mu.RUnlock()
+
+	if exists && pool != nil {
+		pool.DropConn(conn)
+	} else if conn != nil {
+		_ = conn.Close()
+	}
 }
 
 // ReconcilePeers synchronizes active peer pools with the provided slice of active cluster addresses,
@@ -454,36 +387,32 @@ func (m *MeshPool) ReconcilePeers(activeAddrs []string, selfAddr string) {
 	}
 }
 
-// TotalLiveConnections returns the total count of live QUIC connections across all peer pools.
+// TotalLiveConnections returns the total count of live idle connections across all peer pools.
 func (m *MeshPool) TotalLiveConnections() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+
 	total := 0
-	for _, p := range m.peers {
-		total += p.LiveCount()
+	for _, pool := range m.peers {
+		if pool != nil {
+			total += len(pool.conns)
+		}
 	}
 	return total
 }
 
-// PeerCount returns the number of active peer pools.
-func (m *MeshPool) PeerCount() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.peers)
-}
-
-// Close gracefully closes all peer pools in the mesh.
+// Close gracefully closes all peer connection pools in the mesh.
 func (m *MeshPool) Close() {
-	m.cancel()
 	m.mu.Lock()
 	pools := make([]*PeerPool, 0, len(m.peers))
-	for _, p := range m.peers {
-		pools = append(pools, p)
+	for _, pool := range m.peers {
+		pools = append(pools, pool)
 	}
 	m.peers = make(map[string]*PeerPool)
+	m.cancel()
 	m.mu.Unlock()
 
-	for _, p := range pools {
-		p.Close()
+	for _, pool := range pools {
+		pool.Close()
 	}
 }

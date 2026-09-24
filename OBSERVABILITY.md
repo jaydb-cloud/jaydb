@@ -121,7 +121,7 @@ histogram_quantile(0.99,
 |------------|------|--------|-------------|
 | `jaydb_cluster_nodes` | Gauge | - | Current number of nodes in the cluster |
 | `jaydb_cluster_forwarded_requests_total` | Counter | `target_node`, `status` | Total requests forwarded to other cluster nodes |
-| `jaydb_cluster_quic_connections` | Gauge | - | Current number of active QUIC connections |
+| `jaydb_cluster_mesh_connections` | Gauge | - | Current number of active cluster mesh TCP connections (legacy alias: `jaydb_cluster_quic_connections`) |
 
 **Example Query (PromQL):**
 ```promql

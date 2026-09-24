@@ -21,17 +21,14 @@ import (
 // Server encapsulates the FastHTTP server wrapper around the embedded DB engine.
 type Server struct {
 	db       db.DB
-	ring     *sharding.Ring
-	nodeAddr string
-	client   *fasthttp.Client
 	listener net.Listener
 }
 
 // Options configures the server instance.
 type Options struct {
 	DB       db.DB
-	Ring     *sharding.Ring
-	NodeAddr string
+	Ring     *sharding.Ring // Deprecated: inter-node routing is handled automatically by db.DB via the QUIC cluster mesh.
+	NodeAddr string         // Deprecated: node address is managed by db.DB and cluster.Node.
 }
 
 // NewServer initializes a new FastHTTP server wrapping the embedded DB.
@@ -39,15 +36,8 @@ func NewServer(opts Options) (*Server, error) {
 	if opts.DB == nil {
 		return nil, fmt.Errorf("server: embedded DB instance is required")
 	}
-	client := &fasthttp.Client{
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-	}
 	return &Server{
-		db:       opts.DB,
-		ring:     opts.Ring,
-		nodeAddr: opts.NodeAddr,
-		client:   client,
+		db: opts.DB,
 	}, nil
 }
 
@@ -103,15 +93,6 @@ func (s *Server) HandleRequest(ctx *fasthttp.RequestCtx) {
 			}
 		}
 
-		// Inter-node forwarding check
-		if s.ring != nil && s.nodeAddr != "" {
-			targetNode := s.ring.GetNode(key)
-			if targetNode != "" && targetNode != s.nodeAddr {
-				s.proxyToNode(ctx, targetNode)
-				return
-			}
-		}
-
 		switch string(ctx.Method()) {
 		case fasthttp.MethodGet:
 			s.handleGet(ctx, key)
@@ -151,39 +132,6 @@ func (s *Server) getPathPrefix(path string) string {
 	return "unknown"
 }
 
-func (s *Server) proxyToNode(ctx *fasthttp.RequestCtx, targetNode string) {
-	// Security: Prevent forwarding loops by rejecting already-forwarded requests
-	if ctx.Request.Header.Peek("X-Forwarded-By") != nil {
-		ctx.Error("forwarding loop detected", fasthttp.StatusBadRequest)
-		return
-	}
-
-	// Security: Validate target node is actually in the ring to prevent SSRF
-	if s.ring != nil && !s.ring.HasNode(targetNode) {
-		ctx.Error("invalid target node", fasthttp.StatusBadRequest)
-		return
-	}
-
-	req := fasthttp.AcquireRequest()
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseRequest(req)
-	defer fasthttp.ReleaseResponse(resp)
-
-	ctx.Request.CopyTo(req)
-
-	targetURL := fmt.Sprintf("http://%s%s", targetNode, string(ctx.Request.URI().FullURI()))
-	req.SetRequestURI(targetURL)
-	req.Header.Set("X-Forwarded-By", s.nodeAddr)
-
-	if err := s.client.Do(req, resp); err != nil {
-		metrics.ClusterForwardedRequests.WithLabelValues(targetNode, "error").Inc()
-		ctx.Error(fmt.Sprintf("proxy to node %s error: %v", targetNode, err), fasthttp.StatusBadGateway)
-		return
-	}
-
-	metrics.ClusterForwardedRequests.WithLabelValues(targetNode, "success").Inc()
-	resp.CopyTo(&ctx.Response)
-}
 
 func (s *Server) handleGet(ctx *fasthttp.RequestCtx, key string) {
 	// Use request context with timeout instead of Background()

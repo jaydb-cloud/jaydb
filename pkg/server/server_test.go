@@ -124,3 +124,35 @@ func TestServer_REST_API(t *testing.T) {
 		t.Fatalf("expected HTTP 204 on DELETE, got %d", ctx6.Response.StatusCode())
 	}
 }
+
+func TestServer_NoHTTPProxying(t *testing.T) {
+	memStore := memory.NewDriver()
+	database, err := db.Open(db.Options{
+		Storage:       memStore,
+		ShardingDepth: 2,
+	})
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+
+	// Even if NodeAddr is passed in Options (for backward compatibility),
+	// the server must execute against s.db directly without any HTTP proxying.
+	srv, err := NewServer(Options{
+		DB:       database,
+		NodeAddr: "127.0.0.1:9999",
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Request.Header.SetMethod(fasthttp.MethodPut)
+	ctx.Request.SetRequestURI("/v1/kv/test/key")
+	ctx.Request.SetBodyString(`"hello"`)
+	srv.HandleRequest(ctx)
+
+	if ctx.Response.StatusCode() != fasthttp.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", ctx.Response.StatusCode())
+	}
+}
+

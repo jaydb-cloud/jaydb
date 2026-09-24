@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -418,3 +419,149 @@ func (c *countingDriver) List(ctx context.Context, prefix string, opts storage.L
 func (c *countingDriver) Close() error {
 	return c.inner.Close()
 }
+
+// TestCacheLocationInCluster verifies that caching occurs strictly on the target (owner) node
+// and NOT on the node that receives/handles the user request.
+func TestCacheLocationInCluster(t *testing.T) {
+	ring := sharding.NewRing(3, 2)
+
+	// Node 1 (Storage + DB 1)
+	store1 := memory.NewDriver()
+	db1, err := db.Open(db.Options{
+		Storage:       store1,
+		ShardingDepth: 2,
+		Ring:          ring,
+	})
+	if err != nil {
+		t.Fatalf("db1 open error: %v", err)
+	}
+	defer db1.Close()
+
+	node1, err := cluster.NewNode(cluster.NodeConfig{
+		NodeName:  "node-1",
+		BindAddr:  "127.0.0.1",
+		BindPort:  0,
+		QuicPort:  0,
+		Ring:      ring,
+		DBHandler: db1,
+	})
+	if err != nil {
+		t.Fatalf("node1 creation error: %v", err)
+	}
+	defer node1.Close()
+
+	// Node 2 (Storage + DB 2)
+	store2 := memory.NewDriver()
+	node2, err := cluster.NewNode(cluster.NodeConfig{
+		NodeName:  "node-2",
+		BindAddr:  "127.0.0.1",
+		BindPort:  0,
+		QuicPort:  0,
+		JoinAddrs: []string{node1.GossipAddr()},
+		Ring:      ring,
+	})
+	if err != nil {
+		t.Fatalf("node2 creation error: %v", err)
+	}
+	defer node2.Close()
+
+	db2, err := db.Open(db.Options{
+		Storage:       store2,
+		ShardingDepth: 2,
+		Ring:          ring,
+		ClusterNode:   node2,
+	})
+	if err != nil {
+		t.Fatalf("db2 open error: %v", err)
+	}
+	defer db2.Close()
+
+	// Node 1 needs ClusterNode configured so its own SelfQuicAddr is known to db1
+	// and node2 needs DBHandler set so it can also serve requests if routed.
+	node2.RegisterHandler("", db2)
+
+	// Wait for cluster gossip convergence
+	time.Sleep(2 * time.Second)
+
+	node1Addr := node1.SelfQuicAddr()
+	node2Addr := node2.SelfQuicAddr()
+
+	// Find a key owned specifically by node1
+	var targetKey string
+	for i := 0; i < 200; i++ {
+		candidate := fmt.Sprintf("items/%d/profile", i)
+		if ring.GetNode(candidate) == node1Addr {
+			targetKey = candidate
+			break
+		}
+	}
+	if targetKey == "" {
+		t.Fatal("Could not find a key owned by node1")
+	}
+
+	t.Logf("Selected key %q owned by node1 (%s), requested via node2 (%s)", targetKey, node1Addr, node2Addr)
+
+	ctx := context.Background()
+
+	// 1. Write the document via Node 2 (non-owner).
+	// Node 2 forwards to Node 1 over the QUIC cluster mesh.
+	meta, err := db2.Put(ctx, targetKey, []byte("cached-payload-123"))
+	if err != nil {
+		t.Fatalf("Put via node2 failed: %v", err)
+	}
+	if meta.ETag == "" {
+		t.Fatal("Expected valid ETag")
+	}
+
+	// Verify Cache on Owner (Node 1):
+	// Node 1 handled the write in PutRaw, so it MUST be cached in db1!
+	hits1, _, _ := db1.Cache().Stats()
+	items1, _ := db1.Cache().GetCacheSize()
+	if items1 == 0 {
+		t.Error("Expected Node 1 (owner) cache to contain data, but items count is 0")
+	}
+
+	// Verify Cache on Request-Handler (Node 2):
+	// Node 2 is a non-owner, so it MUST NOT cache the data!
+	items2, _ := db2.Cache().GetCacheSize()
+	if items2 != 0 {
+		t.Errorf("Expected Node 2 (request-handler) cache to be empty, got %d items", items2)
+	}
+	hits2, _, _ := db2.Cache().Stats()
+	if hits2 != 0 {
+		t.Errorf("Expected Node 2 to have 0 cache hits, got %d", hits2)
+	}
+
+	// 2. Read the document back via Node 2 (non-owner).
+	// Node 2 forwards the Get to Node 1 via QUIC mesh.
+	var readVal []byte
+	readMeta, err := db2.Get(ctx, targetKey, &readVal)
+	if err != nil {
+		t.Fatalf("Get via node2 failed: %v", err)
+	}
+	if string(readVal) != "cached-payload-123" {
+		t.Fatalf("Expected 'cached-payload-123', got %q", string(readVal))
+	}
+	if readMeta.ETag != meta.ETag {
+		t.Fatalf("ETag mismatch: put=%s, get=%s", meta.ETag, readMeta.ETag)
+	}
+
+	// 3. Verify Cache Hit occurred on Node 1 (Owner) and NOT on Node 2:
+	newHits1, _, _ := db1.Cache().Stats()
+	newHits2, _, _ := db2.Cache().Stats()
+
+	if newHits1 <= hits1 {
+		t.Errorf("Expected Node 1 (owner) cache hits to increase, before=%d, after=%d", hits1, newHits1)
+	}
+	if newHits2 != 0 {
+		t.Errorf("Expected Node 2 (request-handler) cache hits to remain 0, got %d", newHits2)
+	}
+	afterItems2, _ := db2.Cache().GetCacheSize()
+	if afterItems2 != 0 {
+		t.Errorf("Expected Node 2 cache to remain empty after read, got %d items", afterItems2)
+	}
+
+	t.Logf("Cache verification passed: Node 1 (owner) hits=%d items=%d, Node 2 (handler) hits=%d items=%d",
+		newHits1, items1, newHits2, afterItems2)
+}
+

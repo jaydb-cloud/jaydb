@@ -6,7 +6,7 @@
 
 **Cache-Accelerated Document Store Backed by S3 and Optimistic Concurrency**
 
-*In-memory caching • S3/R2 durable cold storage • Atomic CAS via ETags • QUIC cluster mesh*
+*In-memory caching • S3/R2 durable cold storage • Atomic CAS via ETags • High-performance TCP cluster mesh*
 
 [![CI Status](https://github.com/jaydb-cloud/jaydb/actions/workflows/ci.yml/badge.svg)](https://github.com/jaydb-cloud/jaydb/actions/workflows/ci.yml)
 [![Go Reference](https://img.shields.io/badge/Go-Reference-007d9c?logo=go&logoColor=white)](https://pkg.go.dev/github.com/avivklas/jaydb)
@@ -37,7 +37,7 @@ Because JayDB can run embedded as a pure Go library or with built-in `memory` an
 - **💸 Under $0.32/Month at Scale**: Uses S3-compatible object storage as primary cold storage. Handles 1,000,000 API requests/month for pennies; idle instances cost $0.00.
 - **⚡ Microsecond Read Latencies & Singleflight Coalescing**: Authoritative owner-node caching serves hot reads from memory. Concurrent cache misses coalesce at the key level, ensuring only **1 cold read** reaches S3.
 - **🔒 Atomic Optimistic Concurrency Control (CAS)**: Race-condition-free updates across nodes using standard HTTP ETags (`If-Match` and `If-None-Match: *`).
-- **🌐 Peer-to-Peer Cluster Mesh**: Automatic node discovery via memberlist SWIM gossip (`memberlist`), deterministic partition ring, and multiplexed QUIC streams (`quic-go`) for sub-millisecond inter-query routing.
+- **🌐 Peer-to-Peer Cluster Mesh**: Automatic node discovery via memberlist SWIM gossip (`memberlist`), deterministic partition ring, and persistent pooled TCP binary framing for sub-millisecond inter-query routing.
 - **📁 Hierarchical Keys & Schema-Free**: Store structured JSON, MessagePack, or raw binary payloads under intuitive URI-like document paths (`users/123/profile`, `teams/alpha/tasks/987`).
 - **🔍 ListCache with Prefix Invalidation**: In-memory caching for directory and prefix listings with automatic invalidation on writes, preserving strict read-after-write consistency.
 - **📦 Zero-Dependency Local Dev & Testing**: Built-in `memory` and `fs` storage drivers allow running tests and local development with **zero Docker containers, zero external processes, and zero cloud credentials**.
@@ -53,7 +53,7 @@ Because JayDB can run embedded as a pure Go library or with built-in `memory` an
 | **Ops & Maintenance** | Sizing disks/replicas, connection pools, upgrades | Sharding keys, throughput provisioning | **No disks to manage** (durable persistence in S3) |
 | **Local Dev & CI** | Requires Docker, daemon, credentials | Requires Docker or mock services | **Zero dependency** (`memory` / `fs` drivers built-in) |
 | **Schema & Migrations** | Strict DDL schemas, migration scripts | Partial schema / key limits | **Schema-free document trees** (JSON, MsgPack, Raw) |
-| **Cluster Coordination** | Complex read-replicas, proxies, connection pools | Sentinel, Redis Cluster, DynamoDB partitions | **SWIM gossip + QUIC multiplexed mesh** |
+| **Cluster Coordination** | Complex read-replicas, proxies, connection pools | Sentinel, Redis Cluster, DynamoDB partitions | **SWIM gossip + TCP binary mesh** |
 | **Concurrency Control** | Row locks, transactions, deadlock management | Mutexes or Lua scripts | **Lock-free HTTP CAS (ETags / If-Match)** |
 | **AI Agent Ergonomics** | High configuration friction, migration errors | Low-level key semantics | **Frictionless document store (REST & Go API)** |
 
@@ -69,7 +69,7 @@ JayDB can be deployed as an **embedded Go library** or as a **clustered standalo
 |  - fasthttp RESTful HTTP API (GET, PUT, DELETE, LIST)                         |
 |  - Memberlist Gossip Discovery (SWIM Protocol)                                |
 |  - Lexicographical Partition Ring (Prefix-based key distribution)             |
-|  - Multiplexed QUIC Connection Mesh (Sub-millisecond inter-query execution)   |
+|  - Persistent TCP Connection Mesh (Sub-millisecond binary inter-query routing)|
 +-------------------------------------------------------------------------------+
                                         |
                                         v (Wraps internally)
@@ -293,7 +293,7 @@ curl -i "http://localhost:8080/v1/kv/users/?list=true&limit=50"
 
 ### 3. Distributed Multi-Node Cluster
 
-Deploy multi-node clusters with automatic peer discovery via Memberlist (SWIM gossip) and sub-millisecond query forwarding over a multiplexed QUIC connection mesh:
+Deploy multi-node clusters with automatic peer discovery via Memberlist (SWIM gossip) and sub-millisecond query forwarding over a persistent TCP binary connection mesh:
 
 ```go
 // Node 1 (Seed node)
@@ -301,7 +301,7 @@ node1, _ := cluster.NewNode(cluster.NodeConfig{
     NodeName: "node-1",
     BindAddr: "10.0.0.1",
     BindPort: 19001, // Memberlist gossip port
-    QuicPort: 19002, // QUIC mesh routing port
+    MeshPort: 19002, // TCP binary mesh routing port (QuicPort alias supported)
     Ring:     ring,
     DBHandler: dbInstance1,
 })
@@ -311,7 +311,7 @@ node2, _ := cluster.NewNode(cluster.NodeConfig{
     NodeName:  "node-2",
     BindAddr:  "10.0.0.2",
     BindPort:  19001,
-    QuicPort:  19002,
+    MeshPort:  19002,
     JoinAddrs: []string{"10.0.0.1:19001"},
     Ring:      ring,
     DBHandler: dbInstance2,
@@ -320,21 +320,21 @@ node2, _ := cluster.NewNode(cluster.NodeConfig{
 
 #### Dynamic / Ephemeral Ports
 
-Set `BindPort: 0` or `QuicPort: 0` to let the OS assign free ports—ideal for local integration tests, ephemeral test containers, or dynamic microservice environments:
+Set `BindPort: 0` or `MeshPort: 0` to let the OS assign free ports—ideal for local integration tests, ephemeral test containers, or dynamic microservice environments:
 
 ```go
 node, _ := cluster.NewNode(cluster.NodeConfig{
     NodeName: "node-worker",
     BindAddr: "127.0.0.1",
     BindPort: 0,
-    QuicPort: 0,
+    MeshPort: 0,
     Ring:     ring,
     DBHandler: dbInstance,
 })
 
 // Retrieve the bound addresses for peer configuration
 gossipAddr := node.GossipAddr()   // e.g. "127.0.0.1:54312"
-quicAddr   := node.SelfQuicAddr() // e.g. "127.0.0.1:54313"
+meshAddr   := node.SelfMeshAddr() // e.g. "127.0.0.1:54313" (SelfQuicAddr() also supported)
 ```
 
 ---
@@ -371,7 +371,7 @@ JayDB provides native Prometheus metrics tracking engine internals out of the bo
 - **Storage Latencies**: `jaydb_storage_operation_duration_seconds` histogram partitioned by driver and operation (`get`, `put`, `delete`, `list`).
 - **HTTP Throughput**: `jaydb_http_requests_total` partitioned by route, HTTP method, and status code.
 - **Concurrency & Contention**: `jaydb_cas_conflicts_total` tracking optimistic locking collisions.
-- **Cluster Mesh Health**: `jaydb_cluster_nodes`, inter-query forwarded requests, and active QUIC streams.
+- **Cluster Mesh Health**: `jaydb_cluster_nodes`, inter-query forwarded requests, and active mesh connections.
 
 ```bash
 # Scrape metrics directly from the server

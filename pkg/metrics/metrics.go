@@ -123,10 +123,13 @@ var (
 		Help: "Total number of forwarded requests by status",
 	}, []string{"target_node", "status"})
 
-	ClusterQuicConnections = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "jaydb_cluster_quic_connections",
-		Help: "Current number of active QUIC connections",
+	ClusterMeshConnections = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "jaydb_cluster_mesh_connections",
+		Help: "Current number of active cluster mesh TCP connections",
 	})
+
+	// ClusterQuicConnections is deprecated: use ClusterMeshConnections instead.
+	ClusterQuicConnections = ClusterMeshConnections
 
 	// Database operation metrics
 	DBOperationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
