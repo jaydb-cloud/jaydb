@@ -89,8 +89,17 @@ func (p *PeerPool) EnsureConnected(ctx context.Context) error {
 		default:
 		}
 
+		p.mu.RLock()
+		closed := p.closed
+		connCount := len(p.conns)
+		p.mu.RUnlock()
+
+		if closed {
+			return ErrPeerPoolClosed
+		}
+
 		// Don't dial if channel is already full
-		if len(p.conns) >= p.cfg.PoolSize {
+		if connCount >= p.cfg.PoolSize {
 			return nil
 		}
 
@@ -100,6 +109,15 @@ func (p *PeerPool) EnsureConnected(ctx context.Context) error {
 		}
 		if tc, ok := conn.(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
+		}
+
+		p.mu.RLock()
+		closed = p.closed
+		p.mu.RUnlock()
+
+		if closed {
+			_ = conn.Close()
+			return ErrPeerPoolClosed
 		}
 
 		select {
@@ -199,9 +217,16 @@ func (p *PeerPool) Close() {
 	p.cancel()
 	p.mu.Unlock()
 
-	close(p.conns)
-	for conn := range p.conns {
-		_ = conn.Close()
+	// Drain all idle connections from the pool without closing channel
+	for {
+		select {
+		case conn := <-p.conns:
+			if conn != nil {
+				_ = conn.Close()
+			}
+		default:
+			return
+		}
 	}
 }
 
