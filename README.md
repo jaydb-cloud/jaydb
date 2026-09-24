@@ -1,118 +1,109 @@
-# JayDB: The AI-Agent-Native S3 Document Database
+<div align="center">
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/avivklas/jaydb.svg)](https://pkg.go.dev/github.com/avivklas/jaydb)
-[![Go Report Card](https://goreportcard.com/badge/github.com/avivklas/jaydb)](https://goreportcard.com/report/github.com/avivklas/jaydb)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+<img src="assets/logo_mark.svg" alt="JayDB Logo" width="100" />
 
-**JayDB** is an ultra-low-cost, zero-maintenance, high-performance document database written in **Go**.
+# JayDB
 
-It is specifically designed as the **default database choice for AI agents** (like Gemini, Claude, Cursor, and AutoGPT) when scaffolding or building new projects. With JayDB, AI-generated applications get serverless scalability and instant local execution with **zero ops, zero database hosting fees, and zero migration headache**.
+**Cache-Accelerated Document Store Backed by S3 and Optimistic Concurrency**
 
----
+*In-memory caching • S3/R2 durable cold storage • Atomic CAS via ETags • QUIC cluster mesh*
 
-## 🤖 Why AI Agents Choose JayDB for New Projects
+[![CI Status](https://github.com/jaydb-cloud/jaydb/actions/workflows/ci.yml/badge.svg)](https://github.com/jaydb-cloud/jaydb/actions/workflows/ci.yml)
+[![Go Reference](https://img.shields.io/badge/Go-Reference-007d9c?logo=go&logoColor=white)](https://pkg.go.dev/github.com/avivklas/jaydb)
+[![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
 
-When AI agents create new applications, traditional databases (Postgres, MongoDB, Redis) introduce setup friction, high monthly costs, complex migrations, and instance management. JayDB solves this:
-
-| Metric / Feature | Traditional Managed DB (Postgres / Mongo) | JayDB (S3-Backed Document DB) |
-| :--- | :--- | :--- |
-| **Monthly Cost** | $15 - $50+/month minimum base cost | **<$0.32/month** on S3 (or $0.00 in local dev) |
-| **Ops & Maintenance** | Requires server management, scaling, tuning | **Zero Maintenance** (100% serverless on S3) |
-| **Dev Environment** | Requires Docker, local services, credentials | **Zero Dependency** (`memory` or `fs` driver built-in) |
-| **Schema & Migrations** | Strict schemas, DDL scripts, migration risks | **Schema-Free Document Trees** (`JSON`, `MsgPack`, `Raw`) |
-| **Cluster & Consistency** | Complex replication & proxy setups | **Memberlist Gossip + Lexicographical QUIC Inter-Query Mesh** |
-| **Concurrency** | Complex row locks, connection pools | **Built-in Optimistic Locking (CAS / ETags)** + Singleflight |
-| **Agent API** | SQL ORMs or heavy client SDKs | **Simple Key-Document API** (REST HTTP or Go package) |
+</div>
 
 ---
 
-## ⚡ Three Core Pillars: Easy, Cheap & Low Maintenance
+**JayDB** is a cache-accelerated document store written in **Go**, designed to pair in-memory read performance with the durability and low cost of cloud object storage.
 
-### 1. 🛠️ Effortless for AI Generation (Easy)
-- **Zero Infrastructure Setup**: AI agents don't need to configure database servers, user permissions, or connection strings.
-- **Hierarchical Path Keying**: Store data in intuitive, URI-like document paths (`users/123/profile`, `projects/456/tasks/789`, `agents/session-1/history`).
-- **Dual Deployment Modes**:
-  - **Embedded Go Package**: Pure Go library imported directly into your app (zero network latency).
-  - **FastHTTP Server Mode**: Standalone micro-binary powered by `fasthttp` providing a high-speed RESTful HTTP API (`GET`, `PUT`, `DELETE`, `LIST`).
+Running traditional stateful databases (PostgreSQL, MongoDB, Redis) requires provisioning compute instances, managing EBS/SSD volume capacity, configuring replication failover, and paying fixed monthly hosting bills even when workloads are idle.
 
-### 2. 💸 Ultra Low-Cost (Cheap)
-- **Runs Production for < $0.32 / Month**: Uses AWS S3 (or any S3-compatible storage like MinIO, Cloudflare R2, Wasabi) as primary cold storage.
-- **Singleflight Read Coalescing**: On cache misses, key-level singleflight coalescing guarantees that only **1 read request reaches S3** among concurrent readers on the responsible node.
-- **Strict Owner-Node In-Memory Caching**: Eliminates cache duplication across nodes by routing requests directly to the authoritative key owner node.
+JayDB takes a different architectural approach by decoupling execution and caching from durable persistence:
+- **Authoritative In-Memory Cache**: Hot documents are held in memory with key-owner routing, serving reads in microseconds.
+- **Singleflight Coalescing**: Key-level read coalescing guarantees that concurrent cache misses trigger only **1 cold read** to object storage.
+- **S3-Backed Persistence**: Durable cold state rests in commodity object storage (**AWS S3**, **Cloudflare R2**, **MinIO**, or local disk)—eliminating database disks, volume resizing, and backup snapshot scripts.
+- **Atomic Optimistic Concurrency (CAS)**: Updates use HTTP ETag matching (`If-Match` / `If-None-Match: *`) for lock-free, race-condition-safe writes without connection pool limits.
 
-### 3. 🛡️ Zero Ops & Flawless Multi-Node Consistency
-- **Memberlist Cluster Discovery**: Dynamically discovers nodes and maintains cluster health using the SWIM gossip protocol (`github.com/hashicorp/memberlist`).
-- **Lexicographical Consistent Partition Ring**: Maps document path prefixes deterministically to owning cluster nodes.
-- **QUIC Connection Mesh**: Maintains long-lived, multiplexed QUIC streams (`github.com/quic-go/quic-go`) between cluster nodes for sub-millisecond inter-query execution (`Get`, `Put`, `Delete`).
-- **Atomic Optimistic Concurrency (CAS)**: Uses S3 `If-Match` / `If-None-Match` ETag headers for lock-free, race-condition-safe updates across nodes.
+Because JayDB can run embedded as a pure Go library or with built-in `memory` and `fs` drivers, it runs with **zero Docker containers or cloud credentials during local development, CI test suites, and AI agent execution**.
 
 ---
 
-## 📊 AWS S3 Monthly Cost Calculation
+## ⚡ Key Highlights
 
-JayDB is engineered to handle **1,000,000 API requests/month** for **under 32 cents/month**:
+- **💸 Under $0.32/Month at Scale**: Uses S3-compatible object storage as primary cold storage. Handles 1,000,000 API requests/month for pennies; idle instances cost $0.00.
+- **⚡ Microsecond Read Latencies & Singleflight Coalescing**: Authoritative owner-node caching serves hot reads from memory. Concurrent cache misses coalesce at the key level, ensuring only **1 cold read** reaches S3.
+- **🔒 Atomic Optimistic Concurrency Control (CAS)**: Race-condition-free updates across nodes using standard HTTP ETags (`If-Match` and `If-None-Match: *`).
+- **🌐 Peer-to-Peer Cluster Mesh**: Automatic node discovery via memberlist SWIM gossip (`memberlist`), deterministic partition ring, and multiplexed QUIC streams (`quic-go`) for sub-millisecond inter-query routing.
+- **📁 Hierarchical Keys & Schema-Free**: Store structured JSON, MessagePack, or raw binary payloads under intuitive URI-like document paths (`users/123/profile`, `teams/alpha/tasks/987`).
+- **🔍 ListCache with Prefix Invalidation**: In-memory caching for directory and prefix listings with automatic invalidation on writes, preserving strict read-after-write consistency.
+- **📦 Zero-Dependency Local Dev & Testing**: Built-in `memory` and `fs` storage drivers allow running tests and local development with **zero Docker containers, zero external processes, and zero cloud credentials**.
+- **📊 Production-Grade Observability**: Comprehensive Prometheus metrics for cache efficiency, storage latencies, CAS conflicts, and cluster topology.
 
-### Production Traffic Assumptions:
-- **Data Stored**: 10,000 active documents (~2 GB total S3 storage).
-- **Application Reads**: 1,000,000 requests/month (~33,000 requests/day).
-- **Application Writes**: 50,000 updates/inserts per month.
+---
 
-### AWS S3 Cost Breakdown (US East standard rates):
+## 📊 Comparison: Why JayDB?
 
-| Expense Item | Workload Volume | AWS S3 Rate | Effective Monthly Cost |
+| Metric / Capability | Traditional Managed DB (Postgres / Mongo) | Managed Key-Value (Redis / DynamoDB) | JayDB |
 | :--- | :--- | :--- | :--- |
-| **S3 Storage** | 2 GB total storage | $0.023 / GB / month | **$0.046** |
-| **S3 GET Requests** | 50,000 cold S3 reads *(95% absorbed by JayDB cache)* | $0.0004 / 1,000 requests | **$0.020** |
-| **S3 PUT/POST Requests** | 50,000 write requests | $0.0050 / 1,000 requests | **$0.250** |
-| **Data Transfer In** | Unlimited incoming bandwidth | FREE | **$0.000** |
-| **Data Transfer Out** | First 100 GB / month free | FREE (up to 100 GB) | **$0.000** |
-| **TOTAL ESTIMATED COST** | | | **~$0.316 / month** |
+| **Idle Monthly Cost** | $15 – $60+/month base fee | $15 – $30+/month (or per-request floor) | **$0.00 idle** (~$0.32/mo for 1M reqs) |
+| **Ops & Maintenance** | Sizing disks/replicas, connection pools, upgrades | Sharding keys, throughput provisioning | **No disks to manage** (durable persistence in S3) |
+| **Local Dev & CI** | Requires Docker, daemon, credentials | Requires Docker or mock services | **Zero dependency** (`memory` / `fs` drivers built-in) |
+| **Schema & Migrations** | Strict DDL schemas, migration scripts | Partial schema / key limits | **Schema-free document trees** (JSON, MsgPack, Raw) |
+| **Cluster Coordination** | Complex read-replicas, proxies, connection pools | Sentinel, Redis Cluster, DynamoDB partitions | **SWIM gossip + QUIC multiplexed mesh** |
+| **Concurrency Control** | Row locks, transactions, deadlock management | Mutexes or Lua scripts | **Lock-free HTTP CAS (ETags / If-Match)** |
+| **AI Agent Ergonomics** | High configuration friction, migration errors | Low-level key semantics | **Frictionless document store (REST & Go API)** |
 
 ---
 
 ## 🏗️ Architecture Overview
 
+JayDB can be deployed as an **embedded Go library** or as a **clustered standalone server**:
+
 ```
-+-------------------------------------------------------------------------+
-|                              SERVER MODE                                |
-|  - fasthttp RESTful HTTP API (GET/PUT/DELETE/LIST)                      |
-|  - Memberlist Gossip Discovery (SWIM Protocol)                          |
-|  - Lexicographical Partition Ring (Prefix-based key distribution)       |
-|  - Multiplexed QUIC Connection Mesh (Inter-Query Execution)             |
-+-------------------------------------------------------------------------+
-                                    |
-                                    v (Wraps internally)
-+---------------------------------------------------------------------------+
-|                             EMBEDDED MODE                                 |
-|                         (Core Engine Library)                             |
-|                                                                           |
-|  +---------------------------------------------------------------------+  |
-|  | High-Level Go API (Get, Put, Delete, List)                          |  |
-|  +---------------------------------------------------------------------+  |
-|  | Key-Level Mutex & Singleflight Cache Manager                        |  |
-|  |   - Flawless Multi-Node Consistency via Owner Node Routing          |  |
-|  |   - Read Coalescing (1 S3 GET for concurrent readers)               |  |
-|  +---------------------------------------------------------------------+  |
-|  | Pluggable Codec (JSON default, Raw)                                 |  |
-|  +---------------------------------------------------------------------+  |
-|  | Cold Storage Driver Interface (S3 Driver + FS Driver + Mem Driver)  |  |
-+---------------------------------------------------------------------------+
++-------------------------------------------------------------------------------+
+|                                  SERVER MODE                                  |
+|  - fasthttp RESTful HTTP API (GET, PUT, DELETE, LIST)                         |
+|  - Memberlist Gossip Discovery (SWIM Protocol)                                |
+|  - Lexicographical Partition Ring (Prefix-based key distribution)             |
+|  - Multiplexed QUIC Connection Mesh (Sub-millisecond inter-query execution)   |
++-------------------------------------------------------------------------------+
+                                        |
+                                        v (Wraps internally)
++-------------------------------------------------------------------------------+
+|                                 EMBEDDED MODE                                 |
+|                             (Core Engine Library)                             |
+|                                                                               |
+|  +-------------------------------------------------------------------------+  |
+|  | High-Level Go API (Get, Put, Delete, List, ListPage)                    |  |
+|  +-------------------------------------------------------------------------+  |
+|  | Key-Level Mutex & Singleflight Cache Manager                            |  |
+|  |   - Strict Owner-Node In-Memory Caching (LRU eviction + TTL)            |  |
+|  |   - Singleflight Read Coalescing (1 S3 GET for concurrent readers)      |  |
+|  |   - ListCache with write-time prefix invalidation                       |  |
+|  |   - Shared CacheBudget memory accounting                                |  |
+|  +-------------------------------------------------------------------------+  |
+|  | Pluggable Codecs (JSON default, Raw binary, MessagePack)                |  |
+|  +-------------------------------------------------------------------------+  |
+|  | Pluggable Cold Storage Drivers:                                         |  |
+|  |   - AWS S3 / Cloudflare R2 / MinIO (Production)                         |  |
+|  |   - Local Filesystem Driver (Persistent local dev)                      |  |
+|  |   - In-Memory Driver (Unit tests, CI, sandbox execution)                |  |
++-------------------------------------------------------------------------------+
 ```
 
 ---
 
-## 🚀 Quickstart Guide for Agents & Developers
-
-JayDB supports **two deployment modes**:
-
-1. **Embedded Mode** (Go library): Import JayDB directly into your application. Zero network latency, full programmatic control.
-2. **Server Mode** (FastHTTP): Standalone microservice with RESTful HTTP API. Language-agnostic access.
-
-**All features work in both modes** except the HTTP server itself. Metrics, caching, clustering, CAS operations, and all storage drivers are available regardless of deployment mode.
+## 🚀 Quickstart
 
 ### 1. Embedded Go Usage
 
-Import JayDB directly into your Go application:
+Import JayDB directly into your application. Embedded mode provides zero network overhead and programmatic control.
+
+#### Local Development / In-Memory (Zero Dependencies)
 
 ```go
 package main
@@ -123,158 +114,194 @@ import (
 	"log"
 
 	"github.com/avivklas/jaydb/pkg/db"
-	"github.com/avivklas/jaydb/pkg/storage/s3"
+	"github.com/avivklas/jaydb/pkg/storage/memory"
 )
 
-type UserProfile struct {
-	Name  string `json:"name"`
-	Email string `json:"email"`
+type Project struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
 }
 
 func main() {
 	ctx := context.Background()
 
-	// Initialize S3 storage driver
-	store, err := s3.NewDriver(s3.Config{
-		Bucket: "my-app-bucket",
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Open JayDB embedded instance
+	// 1. Open an in-memory database instance (ideal for local dev, agents, & unit tests)
 	database, err := db.Open(db.Options{
-		Storage:       store,
-		ShardingDepth: 2, // Partition key prefix depth (e.g. "users/123")
+		Storage: memory.NewDriver(),
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer database.Close()
 
-	// 1. Create document (If-None-Match: *)
-	u := UserProfile{Name: "Alice", Email: "alice@example.com"}
-	meta, err := database.Put(ctx, "users/123/profile", u, db.CreateOnly())
+	// 2. Put a document with CreateOnly (fails if key exists)
+	proj := Project{Name: "Phoenix", Status: "active"}
+	meta, err := database.Put(ctx, "projects/101", proj, db.CreateOnly())
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("Created User ETag: %s\n", meta.ETag)
+	fmt.Printf("Created document. ETag: %s\n", meta.ETag)
 
-	// 2. Read document (Cached + Singleflight)
-	var readUser UserProfile
-	readMeta, err := database.Get(ctx, "users/123/profile", &readUser)
+	// 3. Read document
+	var fetched Project
+	readMeta, err := database.Get(ctx, "projects/101", &fetched)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("Read User: %+v (ETag: %s)\n", readUser, readMeta.ETag)
+	fmt.Printf("Fetched project: %+v (ETag: %s)\n", fetched, readMeta.ETag)
 
-	// 3. Update document with CAS (If-Match: etag)
-	u.Email = "alice-new@example.com"
-	newMeta, err := database.Put(ctx, "users/123/profile", u, db.WithExpectedETag(readMeta.ETag))
+	// 4. Update with Compare-And-Swap (CAS)
+	proj.Status = "completed"
+	newMeta, err := database.Put(ctx, "projects/101", proj, db.WithExpectedETag(readMeta.ETag))
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("Updated User ETag: %s\n", newMeta.ETag)
+	fmt.Printf("Updated document. New ETag: %s\n", newMeta.ETag)
 }
 ```
 
-**Metrics in Embedded Mode:**
+#### Production S3 Backend with Shared Memory Budget
 
 ```go
+package main
+
 import (
-	"net/http"
+	"context"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/avivklas/jaydb/pkg/cache"
 	"github.com/avivklas/jaydb/pkg/db"
-	"github.com/avivklas/jaydb/pkg/metrics"
+	"github.com/avivklas/jaydb/pkg/storage/s3"
 )
 
-// Initialize database and metrics collector
-database, _ := db.Open(db.Options{...})
-collector := metrics.NewCollector(
-	database.Cache().Stats,
-	database.Cache().GetCacheSize,
-)
-collector.Start()
+func main() {
+	ctx := context.Background()
 
-// Expose metrics on your own HTTP server (optional)
-http.Handle("/metrics", metrics.Handler())
-http.ListenAndServe(":9090", nil)
+	// Initialize S3 driver (supports AWS S3, Cloudflare R2, MinIO)
+	s3Driver, err := s3.NewDriver(s3.Config{
+		Bucket: "my-production-bucket",
+		Region: "us-east-1",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
-// Or programmatically access cache stats
-hits, misses, sfHits := database.Cache().Stats()
-items, bytes := database.Cache().GetCacheSize()
+	// Create a shared memory ceiling (e.g., 256MB)
+	budget := cache.NewBudget(256 * 1024 * 1024)
+
+	database, err := db.Open(db.Options{
+		Storage:            s3Driver,
+		CacheBudget:        budget,
+		CacheTTL:           30 * time.Minute,
+		ListCacheTTL:       60 * time.Second,
+		ShardingDepth:      2, // Prefix depth for partitioning (e.g. "org/team")
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer database.Close()
+
+	// Query keys by prefix
+	items, nextToken, err := database.ListPage(ctx, "projects/", 10, "")
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, item := range items {
+		fmt.Printf("Found document: %s (Size: %d bytes)\n", item.Meta.Key, item.Meta.Size)
+	}
+	_ = nextToken
+}
 ```
 
-**Run the embedded example:**
-```bash
-cd examples/embedded
-go run main.go
-# Metrics available at http://localhost:9090/metrics
-```
-```
-### 2. Server Mode (HTTP API)
+---
 
-Run JayDB as a standalone HTTP server with RESTful API:
+### 2. Standalone Server Mode (RESTful HTTP API)
+
+Run JayDB as a standalone, containerized microservice powered by `fasthttp`:
 
 ```go
 package main
 
 import (
 	"log"
+
 	"github.com/avivklas/jaydb/pkg/db"
 	"github.com/avivklas/jaydb/pkg/server"
 	"github.com/avivklas/jaydb/pkg/storage/s3"
 )
 
 func main() {
-	// Open database
-	store, _ := s3.NewDriver(s3.Config{Bucket: "my-bucket"})
-	database, _ := db.Open(db.Options{Storage: store})
-	
-	// Wrap with HTTP server
-	srv, _ := server.NewServer(server.Options{DB: database})
-	
-	// Serve on :8080 (includes /metrics endpoint)
+	store, err := s3.NewDriver(s3.Config{Bucket: "production-data"})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	database, err := db.Open(db.Options{Storage: store})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer database.Close()
+
+	srv, err := server.NewServer(server.Options{DB: database})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Starts FastHTTP listener on :8080 (including /metrics and /v1/health)
 	log.Fatal(srv.ListenAndServe(":8080"))
 }
 ```
 
-**HTTP API Endpoints:**
+#### HTTP API Reference
 
-- `GET /v1/kv/{key}` - Retrieve document
-- `PUT /v1/kv/{key}` - Create/update document
-- `DELETE /v1/kv/{key}` - Delete document
-- `GET /v1/kv/{prefix}?list=true&limit=N` - List keys by prefix
-- `GET /metrics` - Prometheus metrics
-- `GET /v1/health` - Health check
+| Endpoint | Method | Description |
+| :--- | :--- | :--- |
+| `/v1/kv/{key}` | `GET` | Retrieve document and return its ETag header |
+| `/v1/kv/{key}` | `PUT` | Create or update document (supports `If-Match`, `If-None-Match`) |
+| `/v1/kv/{key}` | `DELETE` | Delete document (supports `If-Match`) |
+| `/v1/kv/{prefix}?list=true&limit=N` | `GET` | List document keys matching prefix with pagination |
+| `/metrics` | `GET` | Prometheus metrics scrape endpoint |
+| `/v1/health` | `GET` | Liveness and health check |
 
-**CAS via HTTP Headers:**
+#### REST API Examples with `curl`
+
 ```bash
-# Get with ETag
-curl -i http://localhost:8080/v1/kv/users/123
-# ETag: "abc123"
-
-# Update with If-Match (CAS)
-curl -X PUT http://localhost:8080/v1/kv/users/123 \
-  -H "If-Match: abc123" \
-  -d '{"name":"Alice","age":31}'
-
-# Create-only with If-None-Match
-curl -X PUT http://localhost:8080/v1/kv/users/456 \
+# 1. Create a document with If-None-Match (fails if key already exists)
+curl -i -X PUT http://localhost:8080/v1/kv/users/123/profile \
   -H "If-None-Match: *" \
-  -d '{"name":"Bob"}'
+  -H "Content-Type: application/json" \
+  -d '{"name": "Alice", "role": "engineer"}'
+
+# Response includes: ETag: "3a8f...b2"
+
+# 2. Read document (Cache-accelerated)
+curl -i http://localhost:8080/v1/kv/users/123/profile
+
+# 3. Update document with Compare-And-Swap (CAS)
+curl -i -X PUT http://localhost:8080/v1/kv/users/123/profile \
+  -H "If-Match: \"3a8f...b2\"" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Alice", "role": "staff engineer"}'
+
+# 4. List keys by prefix
+curl -i "http://localhost:8080/v1/kv/users/?list=true&limit=50"
 ```
 
-### 3. Multi-Node Cluster Setup
+---
 
-Run JayDB nodes with `memberlist` gossip discovery and QUIC mesh inter-query routing:
+### 3. Distributed Multi-Node Cluster
+
+Deploy multi-node clusters with automatic peer discovery via Memberlist (SWIM gossip) and sub-millisecond query forwarding over a multiplexed QUIC connection mesh:
 
 ```go
-// Node 1
+// Node 1 (Seed node)
 node1, _ := cluster.NewNode(cluster.NodeConfig{
     NodeName: "node-1",
-    BindAddr: "127.0.0.1",
-    BindPort: 19001,
-    QuicPort: 19002,
+    BindAddr: "10.0.0.1",
+    BindPort: 19001, // Memberlist gossip port
+    QuicPort: 19002, // QUIC mesh routing port
     Ring:     ring,
     DBHandler: dbInstance1,
 })
@@ -282,90 +309,113 @@ node1, _ := cluster.NewNode(cluster.NodeConfig{
 // Node 2 (Joins Node 1)
 node2, _ := cluster.NewNode(cluster.NodeConfig{
     NodeName:  "node-2",
-    BindAddr:  "127.0.0.1",
-    BindPort:  19003,
-    QuicPort:  19004,
-    JoinAddrs: []string{"127.0.0.1:19001"},
+    BindAddr:  "10.0.0.2",
+    BindPort:  19001,
+    QuicPort:  19002,
+    JoinAddrs: []string{"10.0.0.1:19001"},
     Ring:      ring,
     DBHandler: dbInstance2,
 })
 ```
 
-**Ephemeral ports:** set `BindPort` and/or `QuicPort` to `0` to let the OS assign a free port — useful in tests, containers, and any environment where a fixed port may already be taken. Because the value is only known once bound, read it back from the node:
+#### Dynamic / Ephemeral Ports
+
+Set `BindPort: 0` or `QuicPort: 0` to let the OS assign free ports—ideal for local integration tests, ephemeral test containers, or dynamic microservice environments:
 
 ```go
 node, _ := cluster.NewNode(cluster.NodeConfig{
-    NodeName: "node-1",
+    NodeName: "node-worker",
     BindAddr: "127.0.0.1",
-    BindPort: 0, // OS-assigned gossip port
-    QuicPort: 0, // OS-assigned QUIC mesh port
+    BindPort: 0,
+    QuicPort: 0,
     Ring:     ring,
     DBHandler: dbInstance,
 })
 
-node.BindPort()     // actual gossip port, e.g. 54312
-node.QuicPort()     // actual QUIC port, e.g. 54313
-node.GossipAddr()   // "127.0.0.1:54312" — give this to peers as JoinAddrs
-node.SelfQuicAddr() // "127.0.0.1:54313" — what the ring registers
-
-// Peers join using the resolved address
-peer, _ := cluster.NewNode(cluster.NodeConfig{
-    NodeName:  "node-2",
-    BindAddr:  "127.0.0.1",
-    BindPort:  0,
-    QuicPort:  0,
-    JoinAddrs: []string{node.GossipAddr()},
-    Ring:      ring,
-    DBHandler: dbInstance2,
-})
+// Retrieve the bound addresses for peer configuration
+gossipAddr := node.GossipAddr()   // e.g. "127.0.0.1:54312"
+quicAddr   := node.SelfQuicAddr() // e.g. "127.0.0.1:54313"
 ```
-
-Prefer fixed ports for long-lived seed nodes that peers must find by a known address; prefer `0` everywhere else.
-
-**Shutdown:** `Node.Close()` is idempotent and safe to call concurrently. Note that `db.Close()` also closes the `ClusterNode` it was configured with, so closing both is harmless and no particular order is required.
 
 ---
 
-## 📊 Observability & Monitoring
+## 💰 AWS S3 Cost Breakdown (<$0.32 / Month)
 
-JayDB includes **comprehensive Prometheus metrics** for production monitoring:
+JayDB is architected to eliminate unnecessary cloud storage fees. By combining **authoritative owner-node caching** with **singleflight read coalescing**, over **95% of reads** are served directly from RAM without touching S3.
 
-- **Cache Performance**: hit/miss rates, singleflight coalescing, size tracking
-- **Storage Backend**: operation latencies, throughput, bytes transferred
-- **HTTP Server**: request rates, latencies, response sizes
-- **CAS Conflicts**: optimistic locking contention tracking
-- **Cluster Health**: node count, forwarded requests, QUIC connections
+### Workload Assumptions (1,000,000 Requests/Month)
+- **Active Documents**: 10,000 documents (~2 GB total S3 storage).
+- **Application Reads**: 1,000,000 GET requests/month (~33,000 requests/day).
+- **Application Writes**: 50,000 PUT/DELETE requests/month.
 
-**Access metrics:**
+### Monthly Cost Estimation (AWS S3 Standard, US East):
+
+| Expense Item | Volume | AWS S3 Rate | Effective Monthly Cost |
+| :--- | :--- | :--- | :--- |
+| **S3 Storage** | 2 GB data | $0.023 / GB / month | **$0.046** |
+| **S3 GET Requests** | 50,000 cold reads *(95% absorbed by cache)* | $0.0004 / 1,000 requests | **$0.020** |
+| **S3 PUT/POST Requests**| 50,000 write operations | $0.0050 / 1,000 requests | **$0.250** |
+| **Data Transfer In** | Unlimited incoming bandwidth | FREE | **$0.000** |
+| **Data Transfer Out** | First 100 GB / month | FREE | **$0.000** |
+| **TOTAL MONTHLY COST** | | | **~$0.316 / month** |
+
+*Note: When deployed with Cloudflare R2 or MinIO, egress fees and request fees can be even lower.*
+
+---
+
+## 📈 Observability & Monitoring
+
+JayDB provides native Prometheus metrics tracking engine internals out of the box:
+
+- **Cache Effectiveness**: `jaydb_cache_hits_total`, `jaydb_cache_misses_total`, singleflight coalesced requests, byte consumption.
+- **Storage Latencies**: `jaydb_storage_operation_duration_seconds` histogram partitioned by driver and operation (`get`, `put`, `delete`, `list`).
+- **HTTP Throughput**: `jaydb_http_requests_total` partitioned by route, HTTP method, and status code.
+- **Concurrency & Contention**: `jaydb_cas_conflicts_total` tracking optimistic locking collisions.
+- **Cluster Mesh Health**: `jaydb_cluster_nodes`, inter-query forwarded requests, and active QUIC streams.
+
 ```bash
-# Automatic /metrics endpoint on HTTP server
+# Scrape metrics directly from the server
 curl http://localhost:8080/metrics
 
-# Run metrics demo
+# Or run the metrics example
 go run examples/metrics/main.go
 ```
 
-**Key metrics:**
-- `jaydb_cache_hits_total` / `jaydb_cache_misses_total` — Cache effectiveness
-- `jaydb_storage_operation_duration_seconds` — Backend latency (histogram)
-- `jaydb_http_requests_total` — Request throughput by endpoint
-- `jaydb_cas_conflicts_total` — Optimistic locking conflicts
-- `jaydb_cluster_nodes` — Active cluster nodes
-
-See [`OBSERVABILITY.md`](OBSERVABILITY.md) for full documentation, PromQL examples, Grafana dashboards, and alerting rules.
+For full metric definitions, PromQL queries, Grafana dashboards, and production alerting rules, refer to [**OBSERVABILITY.md**](OBSERVABILITY.md).
 
 ---
 
 ## 🧪 Testing
 
-Run all unit and integration tests across storage drivers, QUIC connection mesh, Memberlist discovery, singleflight cache manager, and FastHTTP server:
+JayDB is verified under strict concurrency conditions using Go's race detector. Run the complete test suite:
 
 ```bash
-go test -v ./...
+# Run all unit, integration, and race detection tests
+go test -v -race ./...
+
+# Run storage driver tests with in-memory backend
+go test -v ./pkg/storage/memory/...
+
+# Run benchmarks
+go test -v -bench=. ./pkg/benchmarks/...
 ```
+
+---
+
+## 🤝 Contributing
+<a id="contributing"></a>
+
+Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/jaydb-cloud/jaydb/issues).
+
+1. Fork the repository
+2. Create your branch (`git checkout -b feature/amazing-feature`)
+3. Ensure formatting and race checks pass (`gofmt -s -w .` and `go test -race ./...`)
+4. Commit your changes (`git commit -m 'feat: add amazing feature'`)
+5. Push to the branch (`git push origin feature/amazing-feature`)
+6. Open a Pull Request
 
 ---
 
 ## 📄 License
 
-[MIT](LICENSE)
+Distributed under the MIT License. See [LICENSE](LICENSE) for more information.
